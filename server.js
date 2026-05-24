@@ -2,12 +2,14 @@
 // Fetches FII data from NSE with proper session cookies
 // Deploy on Render.com free tier
 
-const express = require('express');
-const axios   = require('axios');
-const cors    = require('cors');
+const express  = require('express');
+const axios    = require('axios');
+const cors     = require('cors');
+const Anthropic = require('@anthropic-ai/sdk');
 
-const app  = express();
-const PORT = process.env.PORT || 3001;
+const app    = express();
+const PORT   = process.env.PORT || 3001;
+const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 
 app.use(cors()); // Allow requests from your Vercel app
 
@@ -59,6 +61,54 @@ app.get('/api/fii', async (req, res) => {
 });
 
 // ── Health check ──────────────────────────────────────────
+// ── PCR (Put-Call Ratio) endpoint ────────────────────────
+app.get('/api/pcr', async (req, res) => {
+  try {
+    const cookies  = await getSession();
+    const response = await axios.get(
+      'https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY',
+      { headers: { ...NSE_HEADERS, Cookie: cookies }, timeout: 15000 }
+    );
+    const records = response.data?.records?.data || [];
+    let putOI = 0, callOI = 0;
+    records.forEach(r => {
+      if (r.PE) putOI  += (r.PE.openInterest || 0);
+      if (r.CE) callOI += (r.CE.openInterest || 0);
+    });
+    const pcr = callOI > 0 ? parseFloat((putOI / callOI).toFixed(2)) : null;
+    res.json({ pcr, putOI, callOI, timestamp: new Date().toISOString() });
+  } catch (err) {
+    console.error('PCR fetch failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI NEWS FILTER endpoint ───────────────────────────────
+app.get('/api/news', async (req, res) => {
+  const { stock, symbol } = req.query;
+  if (!stock) return res.status(400).json({ error: 'stock param required' });
+  try {
+    const msg = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001',
+      max_tokens: 120,
+      tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages: [{
+        role: 'user',
+        content: `Search for news about ${stock} (${symbol}.NS) NSE India stock today ${new Date().toLocaleDateString('en-IN')}. Is there any major event (quarterly results, earnings, regulatory action, management change, FPO, acquisition) that would make intraday technical analysis unreliable today? Reply with ONLY: CLEAR or CAUTION: [one short reason]`
+      }]
+    });
+    const text = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
+    const isClear = text.toUpperCase().includes('CLEAR') && !text.toUpperCase().includes('CAUTION');
+    res.json({
+      status: isClear ? 'CLEAR' : 'CAUTION',
+      detail: text.replace(/^CLEAR\s*/i, '').replace(/^CAUTION:\s*/i, '').trim() || text,
+    });
+  } catch (err) {
+    console.error('News check failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status   : 'ok',
