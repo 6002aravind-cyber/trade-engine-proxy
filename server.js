@@ -45,7 +45,57 @@ async function getSession() {
   return session.cookies;
 }
 
-// ── FII/DII endpoint ──────────────────────────────────────
+// ── YAHOO FINANCE MACRO endpoint ─────────────────────────
+const YAHOO_SYMS = '^DJI,^IXIC,^GSPC,^N225,^HSI,CL=F,BZ=F,USDINR=X,^INDIAVIX,^NSEI,^NSEBANK';
+const YF_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+  'Accept': 'application/json',
+};
+app.get('/api/macro', async (req, res) => {
+  try {
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(YAHOO_SYMS)}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketPreviousClose`;
+    const response = await axios.get(url, { headers: YF_HEADERS, timeout: 12000 });
+    res.json(response.data);
+  } catch (err) {
+    // Fallback to v8
+    try {
+      const url2 = `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(YAHOO_SYMS)}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketPreviousClose`;
+      const response2 = await axios.get(url2, { headers: YF_HEADERS, timeout: 12000 });
+      res.json(response2.data);
+    } catch (err2) {
+      console.error('Macro fetch failed:', err2.message);
+      res.status(500).json({ error: err2.message });
+    }
+  }
+});
+
+// ── YAHOO FINANCE CHART endpoint ──────────────────────────
+app.get('/api/chart', async (req, res) => {
+  const { symbol, interval, range } = req.query;
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=${interval||'5m'}&range=${range||'1d'}&includePrePost=false`;
+    const response = await axios.get(url, { headers: YF_HEADERS, timeout: 12000 });
+    res.json(response.data);
+  } catch (err) {
+    console.error('Chart fetch failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── YAHOO FINANCE SCREENER QUOTES endpoint ────────────────
+app.get('/api/quotes', async (req, res) => {
+  const { symbols } = req.query;
+  if (!symbols) return res.status(400).json({ error: 'symbols required' });
+  try {
+    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}&fields=regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange`;
+    const response = await axios.get(url, { headers: YF_HEADERS, timeout: 12000 });
+    res.json(response.data);
+  } catch (err) {
+    console.error('Quotes fetch failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
 app.get('/api/fii', async (req, res) => {
   try {
     const cookies  = await getSession();
