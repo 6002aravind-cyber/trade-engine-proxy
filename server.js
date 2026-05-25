@@ -45,42 +45,38 @@ async function getSession() {
   return session.cookies;
 }
  
-// ── YAHOO FINANCE SESSION ─────────────────────────────────
-const YF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
-let yfSession = { cookies: '', crumb: '', fetchedAt: 0 };
- 
-async function getYahooCrumb() {
-  const age = Date.now() - yfSession.fetchedAt;
-  if (yfSession.crumb && age < 50 * 60 * 1000) return yfSession;
-  try {
-    const c1 = await axios.get('https://fc.yahoo.com', {
-      headers: { 'User-Agent': YF_UA },
-      timeout: 10000, maxRedirects: 5,
-    });
-    const cookies = (c1.headers['set-cookie'] || []).map(c => c.split(';')[0]).join('; ');
-    const c2 = await axios.get('https://query1.finance.yahoo.com/v1/test/getcrumb', {
-      headers: { 'User-Agent': YF_UA, 'Cookie': cookies },
-      timeout: 10000,
-    });
-    yfSession = { cookies, crumb: c2.data, fetchedAt: Date.now() };
-    console.log('Yahoo crumb refreshed');
-  } catch (err) {
-    console.warn('Yahoo crumb failed:', err.message);
-  }
-  return yfSession;
-}
- 
 // ── YAHOO FINANCE MACRO endpoint ─────────────────────────
-const YAHOO_SYMS = '^DJI,^IXIC,^GSPC,^N225,^HSI,CL=F,BZ=F,USDINR=X,^INDIAVIX,^NSEI,^NSEBANK';
+const MACRO_SYMBOLS = [
+  '^DJI','^IXIC','^GSPC','^N225','^HSI',
+  'CL=F','BZ=F','USDINR=X','^INDIAVIX','^NSEI','^NSEBANK'
+];
 app.get('/api/macro', async (req, res) => {
   try {
-    const { cookies, crumb } = await getYahooCrumb();
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(YAHOO_SYMS)}&fields=regularMarketPrice,regularMarketChange,regularMarketChangePercent,regularMarketPreviousClose${crumb?`&crumb=${encodeURIComponent(crumb)}`:''}`;
-    const response = await axios.get(url, {
-      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json', 'Cookie': cookies },
-      timeout: 12000,
-    });
-    res.json(response.data);
+    const results = await Promise.allSettled(
+      MACRO_SYMBOLS.map(async sym => {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=5d&includePrePost=false`;
+        const r = await axios.get(url, {
+          headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' },
+          timeout: 10000,
+        });
+        const meta = r.data?.chart?.result?.[0]?.meta;
+        if (!meta) return null;
+        const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
+        const curr = meta.regularMarketPrice;
+        return {
+          symbol: sym,
+          regularMarketPrice: curr,
+          regularMarketPreviousClose: prev,
+          regularMarketChange: curr - prev,
+          regularMarketChangePercent: prev ? ((curr - prev) / prev) * 100 : 0,
+        };
+      })
+    );
+    const quoteResult = results
+      .filter(r => r.status === 'fulfilled' && r.value)
+      .map(r => r.value);
+    if (!quoteResult.length) return res.status(500).json({ error: 'No data from Yahoo' });
+    res.json({ quoteResponse: { result: quoteResult, error: null } });
   } catch (err) {
     console.error('Macro fetch failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -92,10 +88,9 @@ app.get('/api/chart', async (req, res) => {
   const { symbol, interval, range } = req.query;
   if (!symbol) return res.status(400).json({ error: 'symbol required' });
   try {
-    const { cookies, crumb } = await getYahooCrumb();
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval||'5m'}&range=${range||'1d'}&includePrePost=false${crumb?`&crumb=${encodeURIComponent(crumb)}`:''}`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval||'5m'}&range=${range||'1d'}&includePrePost=false`;
     const response = await axios.get(url, {
-      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json', 'Cookie': cookies },
+      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' },
       timeout: 12000,
     });
     res.json(response.data);
@@ -110,13 +105,31 @@ app.get('/api/quotes', async (req, res) => {
   const { symbols } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
   try {
-    const { cookies, crumb } = await getYahooCrumb();
-    const url = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(symbols)}&fields=regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange${crumb?`&crumb=${encodeURIComponent(crumb)}`:''}`;
-    const response = await axios.get(url, {
-      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json', 'Cookie': cookies },
-      timeout: 12000,
-    });
-    res.json(response.data);
+    const symList = symbols.split(',').slice(0, 15);
+    const results = await Promise.allSettled(
+      symList.map(async sym => {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym.trim())}?interval=1d&range=1d`;
+        const r = await axios.get(url, {
+          headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' },
+          timeout: 8000,
+        });
+        const meta = r.data?.chart?.result?.[0]?.meta;
+        const quote = r.data?.chart?.result?.[0]?.indicators?.quote?.[0];
+        if (!meta) return null;
+        const prev = meta.chartPreviousClose || meta.regularMarketPrice;
+        const curr = meta.regularMarketPrice;
+        return {
+          symbol: sym.trim(),
+          regularMarketPrice: curr,
+          regularMarketVolume: meta.regularMarketVolume || 0,
+          averageDailyVolume10Day: meta.averageDailyVolume10Day || meta.regularMarketVolume || 0,
+          regularMarketChangePercent: prev ? ((curr - prev) / prev) * 100 : 0,
+          regularMarketChange: curr - prev,
+        };
+      })
+    );
+    const quoteResult = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
+    res.json({ quoteResponse: { result: quoteResult, error: null } });
   } catch (err) {
     console.error('Quotes fetch failed:', err.message);
     res.status(500).json({ error: err.message });
