@@ -18,6 +18,33 @@ const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
 app.use(cors());
 app.use(express.json());
 
+// ── SUPABASE (for token persistence) ─────────────────────
+const SB_URL = 'https://wyifvgcyqdzrllezpnmx.supabase.co';
+const SB_KEY = process.env.SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind5aWZ2Z2N5cWR6cmxsZXpwbm14Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzk1OTI3MDQsImV4cCI6MjA5NTE2ODcwNH0.WA2Ke7xhd79AUudwu1IkEOogwxbhnHIjVYyE2WItbVw';
+const SB_HEADERS = { 'Content-Type':'application/json', 'apikey':SB_KEY, 'Authorization':`Bearer ${SB_KEY}` };
+
+async function saveTokenToSupabase(token, expiresAt) {
+  try {
+    await axios.post(`${SB_URL}/rest/v1/settings`,
+      { key:'upstox_token', value:token, expires_at:new Date(expiresAt).toISOString() },
+      { headers:{ ...SB_HEADERS, 'Prefer':'resolution=merge-duplicates' } }
+    );
+    console.log('Upstox token saved to Supabase');
+  } catch(err) { console.warn('Failed to save token to Supabase:', err.message); }
+}
+
+async function loadTokenFromSupabase() {
+  try {
+    const res  = await axios.get(`${SB_URL}/rest/v1/settings?key=eq.upstox_token`, { headers:SB_HEADERS });
+    const row  = res.data?.[0];
+    if (!row?.value) return null;
+    const expiresAt = new Date(row.expires_at).getTime();
+    if (Date.now() >= expiresAt) { console.log('Supabase token expired'); return null; }
+    console.log('Upstox token loaded from Supabase ✓');
+    return { token: row.value, expiresAt };
+  } catch(err) { console.warn('Failed to load token from Supabase:', err.message); return null; }
+}
+
 // ── YAHOO FINANCE USER AGENT (was missing before — caused silent failures) ──
 const YF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -57,16 +84,14 @@ function isUpstoxReady() {
 }
 
 function setUpstoxToken(token) {
-  // Upstox tokens expire at midnight IST — calculate ms until then
   const nowIST       = new Date(Date.now() + 5.5 * 60 * 60 * 1000);
   const midnightIST  = new Date(nowIST);
-  midnightIST.setUTCHours(18, 30, 0, 0); // 18:30 UTC = midnight IST
+  midnightIST.setUTCHours(18, 30, 0, 0);
   if (midnightIST <= nowIST) midnightIST.setUTCDate(midnightIST.getUTCDate() + 1);
-  upstoxToken = {
-    access_token: token,
-    expires_at  : midnightIST.getTime(),
-  };
+  const expiresAt = midnightIST.getTime();
+  upstoxToken = { access_token: token, expires_at: expiresAt };
   console.log('Upstox token set, expires at:', midnightIST.toISOString());
+  saveTokenToSupabase(token, expiresAt); // persist so Render restarts don't lose it
 }
 
 // ── INSTRUMENT KEY MAP (NSE symbol → Upstox instrument_key) ──
@@ -470,27 +495,15 @@ app.get('/api/quotes', async (req, res) => {
   const { symbols } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
   try {
-    const symList = symbols.split(',').slice(0, 15);
-    const results = await Promise.allSettled(
-      symList.map(async sym => {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym.trim())}?interval=1d&range=1d`;
-        const r   = await axios.get(url, { headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' }, timeout: 8000 });
-        const meta = r.data?.chart?.result?.[0]?.meta;
-        if (!meta) return null;
-        const prev = meta.chartPreviousClose || meta.regularMarketPrice;
-        const curr = meta.regularMarketPrice;
-        return {
-          symbol                    : sym.trim(),
-          regularMarketPrice        : curr,
-          regularMarketVolume       : meta.regularMarketVolume || 0,
-          averageDailyVolume10Day   : meta.averageDailyVolume10Day || meta.regularMarketVolume || 0,
-          regularMarketChangePercent: prev ? ((curr - prev) / prev) * 100 : 0,
-          regularMarketChange       : curr - prev,
-        };
-      })
-    );
-    const quoteResult = results.filter(r => r.status === 'fulfilled' && r.value).map(r => r.value);
-    res.json({ quoteResponse: { result: quoteResult, error: null } });
+    // v7 batch API — returns averageDailyVolume10Day properly, one call for all symbols
+    const symList = symbols.split(',').slice(0, 15).map(s => s.trim()).join(',');
+    const fields  = 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange';
+    const r = await axios.get('https://query1.finance.yahoo.com/v7/finance/quote', {
+      params : { symbols: symList, fields },
+      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' },
+      timeout: 10000,
+    });
+    res.json(r.data);
   } catch (err) {
     console.error('Quotes fetch failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -563,7 +576,14 @@ app.get('/', (req, res) => {
   res.send(`Trade Engine Proxy — running.<br>Upstox: ${isUpstoxReady() ? '✓ Connected' : '<a href="/auth/upstox">Connect Upstox</a>'}`);
 });
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Trade Engine Proxy running on port ${PORT}`);
-  console.log(`Upstox: ${isUpstoxReady() ? 'connected' : 'not connected — visit /auth/upstox to connect'}`);
+  // Try to restore Upstox token from Supabase on startup
+  const saved = await loadTokenFromSupabase();
+  if (saved) {
+    upstoxToken = { access_token: saved.token, expires_at: saved.expiresAt };
+    console.log('Upstox token restored from Supabase ✓');
+  } else {
+    console.log('No valid Upstox token — visit /auth/upstox to connect');
+  }
 });
