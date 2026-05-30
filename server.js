@@ -538,6 +538,38 @@ app.get('/api/pcr', async (req, res) => {
   }
 });
 
+// ── AI CHART ANALYSIS ────────────────────────────────────
+app.post('/api/analyze', async (req, res) => {
+  const { symbol, price, vwap, rsi, atr, action, candles } = req.body;
+  if (!price || !vwap) return res.status(400).json({ error: 'price and vwap required' });
+  try {
+    const vwapDev  = (((price - vwap) / vwap) * 100).toFixed(2);
+    const position = price > vwap ? 'above' : 'below';
+    const candleSummary = (candles || []).map(c =>
+      `[O:${c.o?.toFixed(1)} H:${c.h?.toFixed(1)} L:${c.l?.toFixed(1)} C:${c.c?.toFixed(1)} V:${c.v?.toLocaleString('en-IN')}]`
+    ).join(', ');
+    const msg = await client.messages.create({
+      model    : 'claude-haiku-4-5-20251001',
+      max_tokens: 120,
+      messages : [{ role:'user', content:
+        `NSE intraday setup for ${symbol}:
+Price ₹${price} | VWAP ₹${vwap} (${vwapDev}% ${position}) | RSI ${rsi} | ATR ₹${atr}
+Last 5 candles: ${candleSummary}
+Proposed: ${action}
+Rate this setup. Reply in EXACTLY this format:
+QUALITY: HIGH or QUALITY: MEDIUM or QUALITY: LOW | [one sentence — key strength or concern]`
+      }],
+    });
+    const text    = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
+    const quality = text.includes('HIGH') ? 'HIGH' : text.includes('LOW') ? 'LOW' : 'MEDIUM';
+    const detail  = text.replace(/^QUALITY:\s*(HIGH|MEDIUM|LOW)\s*\|?\s*/i, '').trim();
+    res.json({ quality, detail, raw: text });
+  } catch (err) {
+    console.error('AI analyze failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── AI NEWS FILTER ────────────────────────────────────────
 app.get('/api/news', async (req, res) => {
   const { stock, symbol } = req.query;
