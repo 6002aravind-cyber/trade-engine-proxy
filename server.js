@@ -538,6 +538,69 @@ app.get('/api/pcr', async (req, res) => {
   }
 });
 
+// ── SCREENER CACHE + SMART SCREENER ──────────────────────
+let screenerCache = { data: null, fetchedAt: 0 };
+
+app.get('/api/screener', async (req, res) => {
+  const age = Date.now() - screenerCache.fetchedAt;
+  if (screenerCache.data && age < 120000)
+    return res.json({ quotes: screenerCache.data, cached: true });
+  const { symbols } = req.query;
+  if (!symbols) return res.status(400).json({ error: 'symbols required' });
+  try {
+    const symList = symbols.split(',').filter(Boolean);
+    const BATCH = 15, batches = [];
+    for (let i = 0; i < symList.length; i += BATCH) batches.push(symList.slice(i, i + BATCH));
+    const all = await Promise.all(batches.map(async batch => {
+      try {
+        const r = await axios.get('https://query1.finance.yahoo.com/v7/finance/quote', {
+          params: { symbols: batch.join(','), fields: 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange' },
+          headers: { 'User-Agent': YF_UA },
+          timeout: 12000,
+        });
+        return r.data?.quoteResponse?.result || [];
+      } catch (_) { return []; }
+    }));
+    const flat = all.flat().filter(q => q.regularMarketPrice > 0);
+    if (flat.length > 0) screenerCache = { data: flat, fetchedAt: Date.now() };
+    if (flat.length === 0 && screenerCache.data)
+      return res.json({ quotes: screenerCache.data, cached: true, stale: true });
+    res.json({ quotes: flat, cached: false });
+  } catch (err) {
+    if (screenerCache.data) return res.json({ quotes: screenerCache.data, cached: true, stale: true });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI STOCK PICKER ───────────────────────────────────────
+app.post('/api/aipick', async (req, res) => {
+  const { candidates, mode, capital, leverage } = req.body;
+  if (!candidates?.length) return res.status(400).json({ error: 'candidates required' });
+  try {
+    const top = candidates.slice(0, 20);
+    const bp = (capital || 25000) * (leverage || 5);
+    const prompt = `NSE intraday screener today. Mode: ${mode}. Buying power: ₹${Math.round(bp).toLocaleString('en-IN')}.
+
+Top stocks by volume surge:
+${top.map((c, i) => `${i+1}. ${c.symbol.replace('.NS','')} | ₹${c.price} | Vol ${c.volShock}× | ${c.changePct>0?'+':''}${parseFloat(c.changePct).toFixed(2)}% | ${c.sector}`).join('\n')}
+
+Pick 1-3 best for ${mode} intraday. Rules: BUY = positive momentum + volume surge. SHORT = negative + surge. SL = 1-1.5% from entry. Target = 2× SL (1:2 R:R).
+
+Reply ONLY valid JSON, no other text:
+[{"symbol":"RELIANCE","action":"BUY","entry":2850.5,"sl":2821.5,"target":2908.5,"reason":"Volume 3.2× avg, strong uptrend"}]`;
+    const msg = await client.messages.create({
+      model: 'claude-haiku-4-5-20251001', max_tokens: 500,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const text = msg.content?.filter(b => b.type==='text').map(b => b.text).join('') || '[]';
+    const picks = JSON.parse(text.replace(/```json|```/g,'').trim());
+    res.json({ picks, mode });
+  } catch (err) {
+    console.error('AI pick failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── AI CHART ANALYSIS ────────────────────────────────────
 app.post('/api/analyze', async (req, res) => {
   const { symbol, price, vwap, rsi, atr, action, candles } = req.body;
