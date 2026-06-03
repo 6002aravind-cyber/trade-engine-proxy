@@ -909,6 +909,162 @@ app.get('/api/backtest', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════
+//  AI DAILY PREDICTION — web search + technicals
+//  Curated 25 high-predictability NSE stocks
+// ══════════════════════════════════════════════════════════
+
+// High-predictability stocks: liquid, trending, technically clean
+const PREDICT_UNIVERSE = [
+  { sym:'RELIANCE.NS',   name:'Reliance Industries', sector:'Oil & Gas' },
+  { sym:'HDFCBANK.NS',   name:'HDFC Bank',            sector:'Banking' },
+  { sym:'ICICIBANK.NS',  name:'ICICI Bank',           sector:'Banking' },
+  { sym:'INFY.NS',       name:'Infosys',              sector:'IT' },
+  { sym:'TCS.NS',        name:'TCS',                  sector:'IT' },
+  { sym:'SBIN.NS',       name:'SBI',                  sector:'Banking' },
+  { sym:'AXISBANK.NS',   name:'Axis Bank',            sector:'Banking' },
+  { sym:'KOTAKBANK.NS',  name:'Kotak Mahindra Bank',  sector:'Banking' },
+  { sym:'BAJFINANCE.NS', name:'Bajaj Finance',        sector:'Finance' },
+  { sym:'TATAMOTORS.NS', name:'Tata Motors',          sector:'Auto' },
+  { sym:'WIPRO.NS',      name:'Wipro',                sector:'IT' },
+  { sym:'HCLTECH.NS',    name:'HCL Technologies',     sector:'IT' },
+  { sym:'MARUTI.NS',     name:'Maruti Suzuki',        sector:'Auto' },
+  { sym:'TITAN.NS',      name:'Titan Company',        sector:'Consumer' },
+  { sym:'SUNPHARMA.NS',  name:'Sun Pharma',           sector:'Pharma' },
+  { sym:'NTPC.NS',       name:'NTPC',                 sector:'Power' },
+  { sym:'POWERGRID.NS',  name:'Power Grid',           sector:'Power' },
+  { sym:'TATASTEEL.NS',  name:'Tata Steel',           sector:'Metals' },
+  { sym:'HINDALCO.NS',   name:'Hindalco',             sector:'Metals' },
+  { sym:'ADANIPORTS.NS', name:'Adani Ports',          sector:'Infra' },
+  { sym:'LT.NS',         name:'Larsen & Toubro',      sector:'Infra' },
+  { sym:'ONGC.NS',       name:'ONGC',                 sector:'Oil & Gas' },
+  { sym:'ITC.NS',        name:'ITC',                  sector:'FMCG' },
+  { sym:'BAJAJFINSV.NS', name:'Bajaj Finserv',        sector:'Finance' },
+  { sym:'TECHM.NS',      name:'Tech Mahindra',        sector:'IT' },
+];
+
+app.get('/api/aiprediction', async (req, res) => {
+  try {
+    // 1. Fetch 5-day daily OHLCV for all prediction stocks in parallel
+    const quoteResults = await Promise.allSettled(
+      PREDICT_UNIVERSE.map(async ({ sym, name }) => {
+        try {
+          const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=10d&includePrePost=false`;
+          const r = await axios.get(url, { headers: { 'User-Agent': YF_UA }, timeout: 8000 });
+          const result = r.data?.chart?.result?.[0];
+          if (!result) return null;
+          const meta = result.meta;
+          const ts   = result.timestamp || [];
+          const q    = result.indicators.quote[0];
+          const days = ts.map((t, i) => ({
+            date  : new Date(t * 1000).toISOString().split('T')[0],
+            open  : parseFloat((q.open[i]  || 0).toFixed(2)),
+            high  : parseFloat((q.high[i]  || 0).toFixed(2)),
+            low   : parseFloat((q.low[i]   || 0).toFixed(2)),
+            close : parseFloat((q.close[i] || 0).toFixed(2)),
+            volume: q.volume[i] || 0,
+          })).filter(d => d.close > 0);
+          const last   = days.at(-1);
+          const prev   = days.at(-2);
+          if (!last || !prev) return null;
+          const changePct = prev.close ? ((last.close - prev.close) / prev.close * 100) : 0;
+          // Simple technical indicators on daily data
+          const closes = days.map(d => d.close);
+          // EMA20
+          let ema20 = closes[0];
+          for (let i = 1; i < closes.length; i++) ema20 = closes[i] * (2/21) + ema20 * (19/21);
+          // 5-day avg volume
+          const avgVol5 = days.slice(-5).reduce((s, d) => s + d.volume, 0) / 5;
+          const volShock = avgVol5 ? parseFloat((last.volume / avgVol5).toFixed(2)) : 1;
+          // Simple range position (where is close in high-low range over 5 days)
+          const h5 = Math.max(...days.slice(-5).map(d => d.high));
+          const l5 = Math.min(...days.slice(-5).map(d => d.low));
+          const rangePos = h5 > l5 ? parseFloat(((last.close - l5) / (h5 - l5) * 100).toFixed(1)) : 50;
+          return {
+            sym: sym.replace('.NS', ''), name,
+            price: last.close, changePct: parseFloat(changePct.toFixed(2)),
+            ema20: parseFloat(ema20.toFixed(2)),
+            aboveEma: last.close > ema20,
+            volShock, rangePos,
+            high5: h5, low5: l5,
+            days: days.slice(-5), // last 5 daily candles
+          };
+        } catch { return null; }
+      })
+    );
+
+    const stocks = quoteResults
+      .filter(r => r.status === 'fulfilled' && r.value)
+      .map(r => r.value);
+
+    if (!stocks.length) return res.status(500).json({ error: 'Failed to fetch stock data' });
+
+    // 2. Use Claude with web_search to analyse each stock and predict today
+    const today = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
+    const stockSummary = stocks.map(s =>
+      `${s.sym} (${s.sector}) | ₹${s.price} | ${s.changePct > 0 ? '+' : ''}${s.changePct}% yesterday | ` +
+      `EMA20 ₹${s.ema20} (${s.aboveEma ? 'above' : 'below'}) | Vol ${s.volShock}× | ` +
+      `5d range position: ${s.rangePos}% | 5d H:${s.high5} L:${s.low5}`
+    ).join('\n');
+
+    const prompt = `Today is ${today}. You are an NSE intraday analyst. Analyse these 25 liquid NSE stocks for today's intraday session.
+
+STOCK DATA (yesterday's close + 5-day technicals):
+${stockSummary}
+
+For each stock, search the web for:
+1. Any major news today (results, FII buying/selling, sector news, global cues)
+2. Technical pattern (breakout/breakdown, trend strength, key level proximity)
+
+Then give your TOP 5-8 stocks with highest intraday potential today.
+
+Reply ONLY with valid JSON array — no other text, no markdown:
+[
+  {
+    "symbol": "RELIANCE",
+    "action": "BUY",
+    "confidence": "HIGH",
+    "price": 2850.5,
+    "reason": "2-sentence technical + news reason",
+    "pattern": "Breakout above 5d high",
+    "sector": "Oil & Gas",
+    "risk": "Watch for reversal at 2880"
+  }
+]
+action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pick 5-8 stocks only.`;
+
+    const msg = await client.messages.create({
+      model    : 'claude-haiku-4-5-20251001',
+      max_tokens: 2000,
+      tools    : [{ type: 'web_search_20250305', name: 'web_search' }],
+      messages : [{ role: 'user', content: prompt }],
+    });
+
+    // Extract text from response (may have tool_use blocks + text)
+    const text = msg.content
+      .filter(b => b.type === 'text')
+      .map(b => b.text)
+      .join('');
+
+    let predictions = [];
+    try {
+      const match = text.match(/\[[\s\S]*\]/);
+      predictions = match ? JSON.parse(match[0]) : [];
+    } catch { predictions = []; }
+
+    // Enrich with technical data
+    predictions = predictions.map(p => {
+      const stock = stocks.find(s => s.sym === p.symbol);
+      return { ...p, technicals: stock ? { ema20: stock.ema20, aboveEma: stock.aboveEma, volShock: stock.volShock, rangePos: stock.rangePos, high5: stock.high5, low5: stock.low5 } : null };
+    });
+
+    res.json({ predictions, stockCount: stocks.length, generatedAt: new Date().toISOString() });
+  } catch (err) {
+    console.error('AI prediction failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── HEALTH ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
