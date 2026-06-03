@@ -653,6 +653,262 @@ app.get('/api/news', async (req, res) => {
   }
 });
 
+// ══════════════════════════════════════════════════════════
+//  BACKTEST ENGINE — 30-day historical simulation
+//  Replays the exact 4-check algorithm on 5-min candles
+// ══════════════════════════════════════════════════════════
+
+// ── helpers ───────────────────────────────────────────────
+function calcVWAP(candles) {
+  let tpv = 0, vol = 0;
+  return candles.map(c => {
+    const tp = (c.h + c.l + c.c) / 3;
+    tpv += tp * c.v; vol += c.v;
+    return vol > 0 ? tpv / vol : tp;
+  });
+}
+
+function calcRSIArr(closes, period = 14) {
+  if (closes.length < period + 1) return closes.map(() => null);
+  const out = new Array(period).fill(null);
+  let gS = 0, lS = 0;
+  for (let i = 1; i <= period; i++) {
+    const d = closes[i] - closes[i - 1];
+    if (d > 0) gS += d; else lS -= d;
+  }
+  let ag = gS / period, al = lS / period;
+  out.push(al === 0 ? 100 : 100 - 100 / (1 + ag / al));
+  for (let i = period + 1; i < closes.length; i++) {
+    const d = closes[i] - closes[i - 1];
+    ag = (ag * (period - 1) + Math.max(d, 0)) / period;
+    al = (al * (period - 1) + Math.max(-d, 0)) / period;
+    out.push(al === 0 ? 100 : 100 - 100 / (1 + ag / al));
+  }
+  return out;
+}
+
+function calcATR(candles, period = 14) {
+  if (candles.length < period + 1) return null;
+  const trs = candles.slice(1).map((c, i) => {
+    const p = candles[i];
+    return Math.max(c.h - c.l, Math.abs(c.h - p.c), Math.abs(c.l - p.c));
+  });
+  let atr = trs.slice(0, period).reduce((s, v) => s + v, 0) / period;
+  for (let i = period; i < trs.length; i++) atr = (atr * (period - 1) + trs[i]) / period;
+  return atr;
+}
+
+// Exact replicas of the engine check functions
+function runVWAP(price, vwap, rsi, action) {
+  const d = ((price - vwap) / vwap) * 100;
+  if (action === 'BUY') {
+    if (d > 0 && d <= 0.5) return { pass: true, tv: false };
+    if (d <= -1.5 && rsi < 28) return { pass: true, tv: true };
+    return { pass: false };
+  } else {
+    if (d < 0 && Math.abs(d) <= 0.5) return { pass: true, tv: false };
+    if (d >= 1.5 && rsi > 72) return { pass: true, tv: true };
+    return { pass: false };
+  }
+}
+
+function runRSI(rsi, action, vtype) {
+  if (action === 'BUY') {
+    if (vtype === 'tv') return rsi < 28;
+    return (rsi >= 45 && rsi <= 65) || rsi < 28;
+  } else {
+    if (vtype === 'tv') return rsi > 72;
+    return (rsi >= 35 && rsi <= 55) || rsi > 72;
+  }
+}
+
+function runVol(cv, av) { return cv > av * 1.1; }
+
+function runTime(istMins) {
+  return (istMins >= 560 && istMins <= 630) || (istMins >= 780 && istMins <= 870);
+}
+
+// Simulate one trading day on its 5-min candles
+// Returns null if no valid setup found, or { result, entry, sl, t1, t2, exitPrice, pnlGross, action, window }
+function simulateDay(dayCandles, action) {
+  if (dayCandles.length < 16) return null;
+
+  const closes = dayCandles.map(c => c.c);
+  const vwaps  = calcVWAP(dayCandles);
+  const rsiArr = calcRSIArr(closes);
+  const atr    = calcATR(dayCandles);
+  if (!atr) return null;
+
+  for (let i = 15; i < dayCandles.length; i++) {
+    const c      = dayCandles[i];
+    const istMin = c.istMin;
+    if (!runTime(istMin)) continue;
+
+    const price  = c.c;
+    const vwap   = vwaps[i];
+    const rsi    = rsiArr[i];
+    if (vwap == null || rsi == null) continue;
+
+    // 3-bar avg volume (candles i-3..i-1)
+    const prevThree = dayCandles.slice(i - 3, i);
+    const avg3 = prevThree.reduce((s, x) => s + x.v, 0) / 3;
+    if (!runVol(c.v, avg3)) continue;
+
+    const vr = runVWAP(price, vwap, rsi, action);
+    if (!vr.pass) continue;
+    if (!runRSI(rsi, action, vr.tv ? 'tv' : '')) continue;
+
+    // Valid setup found — build plan
+    const sl  = action === 'BUY'
+      ? parseFloat((price - 1.5 * atr).toFixed(2))
+      : parseFloat((price + 1.5 * atr).toFixed(2));
+    const risk = Math.abs(price - sl);
+    if (risk <= 0) continue;
+
+    const t1 = action === 'BUY'
+      ? parseFloat((price + risk).toFixed(2))
+      : parseFloat((price - risk).toFixed(2));
+    const t2 = vr.tv
+      ? parseFloat(vwap.toFixed(2))
+      : action === 'BUY'
+        ? parseFloat((price + risk * 2).toFixed(2))
+        : parseFloat((price - risk * 2).toFixed(2));
+
+    const rr = (Math.abs(t2 - price) / risk);
+    if (rr < 2) continue; // R:R must be >= 2
+
+    // Simulate forward — check remaining candles for T1/T2/SL
+    const win = action === 'BUY';
+    let result = 'TIMEOUT', exitPrice = price;
+    let t1Hit = false;
+
+    for (let j = i + 1; j < dayCandles.length; j++) {
+      const fc = dayCandles[j];
+      if (win) {
+        if (fc.l <= sl) { result = 'LOSS'; exitPrice = sl; break; }
+        if (fc.h >= t2)  { result = 'WIN';  exitPrice = t2; break; }
+        if (fc.h >= t1 && !t1Hit) t1Hit = true;
+      } else {
+        if (fc.h >= sl)  { result = 'LOSS'; exitPrice = sl; break; }
+        if (fc.l <= t2)  { result = 'WIN';  exitPrice = t2; break; }
+        if (fc.l <= t1 && !t1Hit) t1Hit = true;
+      }
+      // Market close — if T1 was hit, treat as partial win (exit at T1)
+      if (j === dayCandles.length - 1 && t1Hit) {
+        result = 'WIN'; exitPrice = t1;
+      }
+    }
+
+    if (result === 'TIMEOUT') {
+      exitPrice = dayCandles.at(-1).c;
+      const timeoutPnl = win ? exitPrice - price : price - exitPrice;
+      result = timeoutPnl >= 0 ? 'TIMEOUT_WIN' : 'TIMEOUT_LOSS';
+    }
+
+    const pnlGross = win
+      ? (exitPrice - price)
+      : (price - exitPrice);
+
+    return {
+      result, action, entry: price, sl, t1, t2, exitPrice,
+      pnlGross: parseFloat(pnlGross.toFixed(2)),
+      rr: parseFloat(rr.toFixed(2)),
+      setupTime: `${Math.floor(istMin / 60)}:${String(istMin % 60).padStart(2, '0')}`,
+      window: (istMin >= 560 && istMin <= 630) ? 'W1' : 'W2',
+      vwap: parseFloat(vwap.toFixed(2)), rsi: parseFloat(rsi.toFixed(1)), atr: parseFloat(atr.toFixed(2)),
+    };
+  }
+  return null;
+}
+
+app.get('/api/backtest', async (req, res) => {
+  const { symbol, days = 30 } = req.query;
+  if (!symbol) return res.status(400).json({ error: 'symbol required' });
+
+  const sym     = symbol.toUpperCase().replace('.NS', '') + '.NS';
+  const nDays   = Math.min(parseInt(days) || 30, 60);
+  const range   = nDays <= 30 ? '60d' : '60d'; // Yahoo max for 5m is 60d
+
+  try {
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=5m&range=${range}&includePrePost=false`;
+    const r   = await axios.get(url, {
+      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' },
+      timeout: 20000,
+    });
+
+    const result = r.data?.chart?.result?.[0];
+    if (!result) return res.status(404).json({ error: 'No data for symbol' });
+
+    const ts = result.timestamp || [];
+    const q  = result.indicators.quote[0];
+
+    // Convert to candles with IST minute
+    const allCandles = ts.map((t, i) => {
+      if (q.open[i] == null || q.close[i] == null) return null;
+      const IST_OFF = 330; // minutes
+      const utcMin  = Math.floor(t / 60) % 1440;
+      const istMin  = (utcMin + IST_OFF) % 1440;
+      const dateIST = new Date((t + 330 * 60) * 1000);
+      const dayKey  = `${dateIST.getUTCFullYear()}-${String(dateIST.getUTCMonth() + 1).padStart(2,'0')}-${String(dateIST.getUTCDate()).padStart(2,'0')}`;
+      return {
+        ts: t, istMin, dayKey,
+        o: q.open[i], h: q.high[i], l: q.low[i], c: q.close[i], v: q.volume[i] || 0,
+      };
+    }).filter(Boolean);
+
+    // Group by day
+    const byDay = {};
+    allCandles.forEach(c => {
+      if (!byDay[c.dayKey]) byDay[c.dayKey] = [];
+      byDay[c.dayKey].push(c);
+    });
+
+    // Only trading days with enough candles (>=20), sorted, last nDays
+    const tradingDays = Object.keys(byDay)
+      .filter(d => byDay[d].length >= 20)
+      .sort()
+      .slice(-nDays);
+
+    if (tradingDays.length === 0) return res.status(404).json({ error: 'No trading days found' });
+
+    const DAILY_FEE = 45;
+    const results = [];
+
+    for (const day of tradingDays) {
+      const candles = byDay[day];
+      // Try BUY first, if no signal try SHORT
+      let trade = simulateDay(candles, 'BUY');
+      if (!trade) trade = simulateDay(candles, 'SHORT');
+
+      results.push({
+        date    : day,
+        ...( trade ? trade : { result: 'NO_SIGNAL', action: null } ),
+        // Normalise P&L to per-trade basis for display (not qty-adjusted since we don't know capital)
+        netPnl  : trade ? parseFloat((trade.pnlGross - DAILY_FEE / 100).toFixed(2)) : 0, // fee scaled to per-share
+      });
+    }
+
+    // Aggregate stats
+    const traded   = results.filter(r => r.result !== 'NO_SIGNAL');
+    const wins     = traded.filter(r => r.result === 'WIN' || r.result === 'TIMEOUT_WIN').length;
+    const losses   = traded.filter(r => r.result === 'LOSS' || r.result === 'TIMEOUT_LOSS').length;
+    const winRate  = traded.length ? Math.round((wins / traded.length) * 100) : 0;
+    const avgWin   = wins ? traded.filter(r => r.result === 'WIN' || r.result === 'TIMEOUT_WIN').reduce((s, t) => s + t.pnlGross, 0) / wins : 0;
+    const avgLoss  = losses ? traded.filter(r => r.result === 'LOSS' || r.result === 'TIMEOUT_LOSS').reduce((s, t) => s + Math.abs(t.pnlGross), 0) / losses : 0;
+    const expectancy = traded.length ? (winRate / 100 * avgWin - (1 - winRate / 100) * avgLoss) : 0;
+
+    res.json({
+      symbol: sym.replace('.NS', ''),
+      days  : tradingDays.length,
+      stats : { trades: traded.length, wins, losses, winRate, avgWin: parseFloat(avgWin.toFixed(2)), avgLoss: parseFloat(avgLoss.toFixed(2)), expectancy: parseFloat(expectancy.toFixed(2)), noSignal: results.length - traded.length },
+      results,
+    });
+  } catch (err) {
+    console.error('Backtest failed:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── HEALTH ────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({
