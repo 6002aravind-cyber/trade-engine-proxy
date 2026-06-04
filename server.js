@@ -1066,6 +1066,33 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
 });
 
 // ── HEALTH ────────────────────────────────────────────────
+// ── FEEDBACK ──────────────────────────────────────────────
+app.post('/api/feedback', async (req, res) => {
+  try {
+    const { text, user: userEmail='anon', ts=new Date().toISOString() } = req.body || {};
+    if (!text?.trim()) return res.status(400).json({ error: 'No feedback text' });
+
+    // Load existing
+    let existing = [];
+    try {
+      const r = await axios.get(`${SB_URL}/rest/v1/settings?key=eq.feedback`, { headers:SB_HEADERS });
+      existing = JSON.parse(r.data?.[0]?.value || '[]');
+    } catch(_) {}
+
+    existing.push({ text:text.trim(), user:userEmail, ts });
+    const trimmed = existing.slice(-200);
+
+    await axios.post(`${SB_URL}/rest/v1/settings`,
+      { key:'feedback', value:JSON.stringify(trimmed) },
+      { headers:{ ...SB_HEADERS, 'Prefer':'resolution=merge-duplicates' } }
+    );
+    res.json({ ok:true });
+  } catch(err) {
+    console.error('Feedback save failed:', err.message);
+    res.status(500).json({ error:err.message });
+  }
+});
+
 app.get('/health', (req, res) => {
   res.json({
     status  : 'ok',
