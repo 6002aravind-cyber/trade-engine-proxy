@@ -1120,4 +1120,16 @@ app.listen(PORT, async () => {
   } else {
     console.log('No valid Upstox token — visit /auth/upstox to connect');
   }
+
+  // ── SELF-PING keep-alive (prevents Render free tier from sleeping) ──
+  // Pings own /health every 10 minutes
+  const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
+  setInterval(async () => {
+    try {
+      const r = await axios.get(`${SELF_URL}/health`, { timeout: 8000 });
+      console.log(`Keep-alive ping ✓ ${new Date().toLocaleTimeString()}`);
+    } catch(e) {
+      console.log(`Keep-alive ping failed: ${e.message}`);
+    }
+  }, 10 * 60 * 1000); // every 10 minutes
 });
