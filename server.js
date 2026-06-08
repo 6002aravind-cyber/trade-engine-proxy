@@ -597,7 +597,8 @@ Reply ONLY valid JSON, no other text:
     res.json({ picks, mode });
   } catch (err) {
     console.error('AI pick failed:', err.message);
-    res.status(500).json({ error: err.message });
+    const isCredit = err.message?.includes('credit') || err.status === 400;
+    res.status(isCredit?402:500).json({ error: isCredit ? 'credit_exhausted' : err.message });
   }
 });
 
@@ -1061,7 +1062,8 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
     res.json({ predictions, stockCount: stocks.length, generatedAt: new Date().toISOString() });
   } catch (err) {
     console.error('AI prediction failed:', err.message);
-    res.status(500).json({ error: err.message });
+    const isCredit = err.message?.includes('credit') || err.status === 400;
+    res.status(isCredit?402:500).json({ error: isCredit ? 'credit_exhausted' : err.message });
   }
 });
 
