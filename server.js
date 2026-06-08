@@ -46,7 +46,54 @@ async function loadTokenFromSupabase() {
 }
 
 // ── YAHOO FINANCE USER AGENT (was missing before — caused silent failures) ──
-const YF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const YF_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36';
+const YF_HEADERS = {
+  'User-Agent': YF_UA,
+  'Accept': 'application/json, text/plain, */*',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Origin': 'https://finance.yahoo.com',
+  'Referer': 'https://finance.yahoo.com/',
+};
+
+// ── Yahoo Finance crumb (required since 2024) ─────────────
+let yfCrumb = null;
+let yfCookie = null;
+let yfCrumbFetchedAt = 0;
+
+const getYFCrumb = async () => {
+  // Reuse crumb for 4 hours
+  if (yfCrumb && yfCookie && Date.now() - yfCrumbFetchedAt < 4 * 3600 * 1000) return { crumb: yfCrumb, cookie: yfCookie };
+  try {
+    // Step 1: get cookie from Yahoo consent page
+    const r1 = await axios.get('https://finance.yahoo.com/', {
+      headers: YF_HEADERS, timeout: 10000, maxRedirects: 5,
+    });
+    const setCookie = r1.headers['set-cookie'] || [];
+    yfCookie = setCookie.map(c => c.split(';')[0]).join('; ');
+
+    // Step 2: fetch crumb
+    const r2 = await axios.get('https://query1.finance.yahoo.com/v1/test/getcrumb', {
+      headers: { ...YF_HEADERS, 'Cookie': yfCookie }, timeout: 8000,
+    });
+    yfCrumb = r2.data;
+    yfCrumbFetchedAt = Date.now();
+    console.log('Yahoo crumb fetched:', yfCrumb?.slice(0,8));
+    return { crumb: yfCrumb, cookie: yfCookie };
+  } catch (e) {
+    console.error('Yahoo crumb fetch failed:', e.message);
+    return { crumb: null, cookie: null };
+  }
+};
+
+const yfGet = async (url, params = {}) => {
+  const { crumb, cookie } = await getYFCrumb();
+  const headers = { ...YF_HEADERS };
+  if (cookie) headers['Cookie'] = cookie;
+  if (crumb) params.crumb = crumb;
+  const r = await axios.get(url, { params, headers, timeout: 12000 });
+  return r.data;
+};
 
 // ── NSE SESSION ───────────────────────────────────────────
 const NSE_HEADERS = {
@@ -453,8 +500,8 @@ app.get('/api/macro', async (req, res) => {
     const results = await Promise.allSettled(
       MACRO_SYMBOLS.map(async sym => {
         const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=5d&includePrePost=false`;
-        const r   = await axios.get(url, { headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' }, timeout: 10000 });
-        const meta = r.data?.chart?.result?.[0]?.meta;
+        const data = await yfGet(url);
+        const meta = data?.chart?.result?.[0]?.meta;
         if (!meta) return null;
         const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
         const curr = meta.regularMarketPrice;
@@ -481,9 +528,9 @@ app.get('/api/chart', async (req, res) => {
   const { symbol, interval, range } = req.query;
   if (!symbol) return res.status(400).json({ error: 'symbol required' });
   try {
-    const url      = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval||'5m'}&range=${range||'1d'}&includePrePost=false`;
-    const response = await axios.get(url, { headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' }, timeout: 12000 });
-    res.json(response.data);
+    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=${interval||'5m'}&range=${range||'1d'}&includePrePost=false`;
+    const data = await yfGet(url);
+    res.json(data);
   } catch (err) {
     console.error('Chart fetch failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -495,15 +542,10 @@ app.get('/api/quotes', async (req, res) => {
   const { symbols } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
   try {
-    // v7 batch API — returns averageDailyVolume10Day properly, one call for all symbols
     const symList = symbols.split(',').slice(0, 15).map(s => s.trim()).join(',');
     const fields  = 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange';
-    const r = await axios.get('https://query1.finance.yahoo.com/v7/finance/quote', {
-      params : { symbols: symList, fields },
-      headers: { 'User-Agent': YF_UA, 'Accept': 'application/json' },
-      timeout: 10000,
-    });
-    res.json(r.data);
+    const data = await yfGet('https://query1.finance.yahoo.com/v7/finance/quote', { symbols: symList, fields });
+    res.json(data);
   } catch (err) {
     console.error('Quotes fetch failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -541,30 +583,47 @@ app.get('/api/pcr', async (req, res) => {
 // ── SCREENER CACHE + SMART SCREENER ──────────────────────
 let screenerCache = { data: null, fetchedAt: 0 };
 
+// Fetch batch of symbols from Yahoo with crumb
+const fetchYahooBatch = async (batch) => {
+  try {
+    const data = await yfGet('https://query1.finance.yahoo.com/v7/finance/quote', {
+      symbols: batch.join(','),
+      fields: 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange',
+    });
+    return data?.quoteResponse?.result || [];
+  } catch (_) { return []; }
+};
+
 app.get('/api/screener', async (req, res) => {
   const age = Date.now() - screenerCache.fetchedAt;
   if (screenerCache.data && age < 120000)
     return res.json({ quotes: screenerCache.data, cached: true });
+
   const { symbols } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
+
   try {
     const symList = symbols.split(',').filter(Boolean);
-    const BATCH = 15, batches = [];
+    const BATCH = 15;
+    const batches = [];
     for (let i = 0; i < symList.length; i += BATCH) batches.push(symList.slice(i, i + BATCH));
-    const all = await Promise.all(batches.map(async batch => {
-      try {
-        const r = await axios.get('https://query1.finance.yahoo.com/v7/finance/quote', {
-          params: { symbols: batch.join(','), fields: 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange' },
-          headers: { 'User-Agent': YF_UA },
-          timeout: 12000,
-        });
-        return r.data?.quoteResponse?.result || [];
-      } catch (_) { return []; }
-    }));
-    const flat = all.flat().filter(q => q.regularMarketPrice > 0);
+
+    // Run batches with concurrency limit of 5 to avoid rate limiting
+    const results = [];
+    for (let i = 0; i < batches.length; i += 5) {
+      const chunk = batches.slice(i, i + 5);
+      const chunkResults = await Promise.all(chunk.map(fetchYahooBatch));
+      results.push(...chunkResults.flat());
+      // Small delay between chunks
+      if (i + 5 < batches.length) await new Promise(r => setTimeout(r, 300));
+    }
+
+    const flat = results.filter(q => q.regularMarketPrice > 0);
     if (flat.length > 0) screenerCache = { data: flat, fetchedAt: Date.now() };
     if (flat.length === 0 && screenerCache.data)
       return res.json({ quotes: screenerCache.data, cached: true, stale: true });
+    if (flat.length === 0)
+      return res.status(500).json({ error: 'Yahoo Finance returned 0 results — may be rate limiting. Wait 60s and retry.' });
     res.json({ quotes: flat, cached: false });
   } catch (err) {
     if (screenerCache.data) return res.json({ quotes: screenerCache.data, cached: true, stale: true });
