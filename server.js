@@ -49,7 +49,7 @@ const callAI = async (prompt, maxTokens = 1000, tools = null) => {
     const text = await callClaude(prompt, maxTokens, tools);
     return { text, source: 'claude' };
   } catch (e) {
-    const isCredit = e.status === 400 || e.message?.includes('credit');
+    const isCredit = e.status === 529 || e.message?.includes('credit') || e.message?.includes('overloaded');
     if (isCredit && grokEnabled) {
       console.log('Claude credits exhausted — falling back to Grok');
       const text = await callGrok(prompt, maxTokens);
@@ -754,7 +754,7 @@ app.get('/api/news', async (req, res) => {
       });
       text = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
     } catch (e) {
-      if ((e.status === 400 || e.message?.includes('credit')) && grokEnabled) {
+      if ((e.status === 529 || e.message?.includes('credit') || e.message?.includes('overloaded')) && grokEnabled) {
         const r = await callGrok(newsPrompt, 120);
         text = r;
       } else throw e;
@@ -1152,7 +1152,7 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
     let aiSource = 'claude';
     try {
       const msg = await client.messages.create({
-        model: 'claude-haiku-4-5', max_tokens: 2000,
+        model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       });
