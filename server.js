@@ -2,9 +2,10 @@
 // Deploy on Render.com free tier
 // Env vars needed:
 //   CLAUDE_API_KEY   — Anthropic key (existing)
-//   UPSTOX_API_KEY   — from developer.upstox.com (new)
-//   UPSTOX_SECRET    — from developer.upstox.com (new)
-//   UPSTOX_REDIRECT  — https://trade-engine-proxy.onrender.com/auth/upstox/callback (new)
+//   GROK_API_KEY     — xAI Grok key (free at console.x.ai)
+//   UPSTOX_API_KEY   — from developer.upstox.com
+//   UPSTOX_SECRET    — from developer.upstox.com
+//   UPSTOX_REDIRECT  — https://trade-engine-proxy.onrender.com/auth/upstox/callback
 
 const express   = require('express');
 const axios     = require('axios');
@@ -14,6 +15,49 @@ const Anthropic = require('@anthropic-ai/sdk');
 const app    = express();
 const PORT   = process.env.PORT || 3001;
 const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
+
+// ── DUAL AI — Claude (primary) + Grok (fallback/parallel) ──
+const grokEnabled = !!process.env.GROK_API_KEY;
+
+const callGrok = async (prompt, maxTokens = 1000) => {
+  if (!grokEnabled) throw new Error('Grok not configured');
+  const r = await axios.post('https://api.x.ai/v1/chat/completions', {
+    model: 'grok-3-mini',
+    max_tokens: maxTokens,
+    messages: [{ role: 'user', content: prompt }],
+  }, {
+    headers: { 'Authorization': `Bearer ${process.env.GROK_API_KEY}`, 'Content-Type': 'application/json' },
+    timeout: 30000,
+  });
+  return r.data.choices?.[0]?.message?.content || '';
+};
+
+const callClaude = async (prompt, maxTokens = 1000, tools = null) => {
+  const params = {
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: maxTokens,
+    messages: [{ role: 'user', content: prompt }],
+  };
+  if (tools) params.tools = tools;
+  const msg = await client.messages.create(params);
+  return msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
+};
+
+// Try Claude first, fall back to Grok if credits exhausted
+const callAI = async (prompt, maxTokens = 1000, tools = null) => {
+  try {
+    const text = await callClaude(prompt, maxTokens, tools);
+    return { text, source: 'claude' };
+  } catch (e) {
+    const isCredit = e.status === 400 || e.message?.includes('credit');
+    if (isCredit && grokEnabled) {
+      console.log('Claude credits exhausted — falling back to Grok');
+      const text = await callGrok(prompt, maxTokens);
+      return { text, source: 'grok' };
+    }
+    throw e;
+  }
+};
 
 app.use(cors());
 app.use(express.json());
@@ -542,10 +586,11 @@ app.get('/api/quotes', async (req, res) => {
   const { symbols } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
   try {
-    const symList = symbols.split(',').slice(0, 15).map(s => s.trim()).join(',');
-    const fields  = 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange';
-    const data = await yfGet('https://query1.finance.yahoo.com/v7/finance/quote', { symbols: symList, fields });
-    res.json(data);
+    const symList = symbols.split(',').slice(0, 15).map(s => s.trim());
+    // Use v8/chart (works when v7/quote is blocked)
+    const results = await Promise.all(symList.map(fetchOneQuote));
+    const valid = results.filter(Boolean);
+    res.json({ quoteResponse: { result: valid, error: null } });
   } catch (err) {
     console.error('Quotes fetch failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -583,15 +628,27 @@ app.get('/api/pcr', async (req, res) => {
 // ── SCREENER CACHE + SMART SCREENER ──────────────────────
 let screenerCache = { data: null, fetchedAt: 0 };
 
-// Fetch batch of symbols from Yahoo with crumb
-const fetchYahooBatch = async (batch) => {
+// v8/chart works when v7/quote is blocked — fetch one symbol at a time
+const fetchOneQuote = async (sym) => {
   try {
-    const data = await yfGet('https://query1.finance.yahoo.com/v7/finance/quote', {
-      symbols: batch.join(','),
-      fields: 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange',
-    });
-    return data?.quoteResponse?.result || [];
-  } catch (_) { return []; }
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=5d&includePrePost=false`;
+    const data = await yfGet(url);
+    const meta = data?.chart?.result?.[0]?.meta;
+    if (!meta || !meta.regularMarketPrice) return null;
+    const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
+    const curr = meta.regularMarketPrice;
+    const vol  = meta.regularMarketVolume || 0;
+    // averageDailyVolume10Day from meta if available
+    const avg10d = meta.averageDailyVolume10Day || meta.averageDailyVolume3Month || 0;
+    return {
+      symbol                    : sym,
+      regularMarketPrice        : curr,
+      regularMarketVolume       : vol,
+      averageDailyVolume10Day   : avg10d,
+      regularMarketChangePercent: prev ? ((curr - prev) / prev) * 100 : 0,
+      regularMarketChange       : curr - prev,
+    };
+  } catch (_) { return null; }
 };
 
 app.get('/api/screener', async (req, res) => {
@@ -604,18 +661,16 @@ app.get('/api/screener', async (req, res) => {
 
   try {
     const symList = symbols.split(',').filter(Boolean);
-    const BATCH = 15;
-    const batches = [];
-    for (let i = 0; i < symList.length; i += BATCH) batches.push(symList.slice(i, i + BATCH));
 
-    // Run batches with concurrency limit of 5 to avoid rate limiting
+    // Fetch with concurrency limit of 10 parallel requests
+    const CONCURRENCY = 10;
     const results = [];
-    for (let i = 0; i < batches.length; i += 5) {
-      const chunk = batches.slice(i, i + 5);
-      const chunkResults = await Promise.all(chunk.map(fetchYahooBatch));
-      results.push(...chunkResults.flat());
-      // Small delay between chunks
-      if (i + 5 < batches.length) await new Promise(r => setTimeout(r, 300));
+    for (let i = 0; i < symList.length; i += CONCURRENCY) {
+      const batch = symList.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(batch.map(fetchOneQuote));
+      results.push(...batchResults.filter(Boolean));
+      // Small delay to avoid rate limiting
+      if (i + CONCURRENCY < symList.length) await new Promise(r => setTimeout(r, 150));
     }
 
     const flat = results.filter(q => q.regularMarketPrice > 0);
@@ -647,13 +702,9 @@ Pick 1-3 best for ${mode} intraday. Rules: BUY = positive momentum + volume surg
 
 Reply ONLY valid JSON, no other text:
 [{"symbol":"RELIANCE","action":"BUY","entry":2850.5,"sl":2821.5,"target":2908.5,"reason":"Volume 3.2× avg, strong uptrend"}]`;
-    const msg = await client.messages.create({
-      model: 'claude-haiku-4-5-20251001', max_tokens: 500,
-      messages: [{ role: 'user', content: prompt }],
-    });
-    const text = msg.content?.filter(b => b.type==='text').map(b => b.text).join('') || '[]';
-    const picks = JSON.parse(text.replace(/```json|```/g,'').trim());
-    res.json({ picks, mode });
+    const { text: rawText, source: aiSrc } = await callAI(prompt, 500);
+    const picks = JSON.parse(rawText.replace(/```json|```/g,'').trim());
+    res.json({ picks, mode, aiSource: aiSrc });
   } catch (err) {
     console.error('AI pick failed:', err.message);
     const isCredit = err.message?.includes('credit') || err.status === 400;
@@ -671,19 +722,13 @@ app.post('/api/analyze', async (req, res) => {
     const candleSummary = (candles || []).map(c =>
       `[O:${c.o?.toFixed(1)} H:${c.h?.toFixed(1)} L:${c.l?.toFixed(1)} C:${c.c?.toFixed(1)} V:${c.v?.toLocaleString('en-IN')}]`
     ).join(', ');
-    const msg = await client.messages.create({
-      model    : 'claude-haiku-4-5-20251001',
-      max_tokens: 120,
-      messages : [{ role:'user', content:
-        `NSE intraday setup for ${symbol}:
+    const analyzePrompt = `NSE intraday setup for ${symbol}:
 Price ₹${price} | VWAP ₹${vwap} (${vwapDev}% ${position}) | RSI ${rsi} | ATR ₹${atr}
 Last 5 candles: ${candleSummary}
 Proposed: ${action}
 Rate this setup. Reply in EXACTLY this format:
-QUALITY: HIGH or QUALITY: MEDIUM or QUALITY: LOW | [one sentence — key strength or concern]`
-      }],
-    });
-    const text    = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
+QUALITY: HIGH or QUALITY: MEDIUM or QUALITY: LOW | [one sentence — key strength or concern]`;
+    const { text } = await callAI(analyzePrompt, 120);
     const quality = text.includes('HIGH') ? 'HIGH' : text.includes('LOW') ? 'LOW' : 'MEDIUM';
     const detail  = text.replace(/^QUALITY:\s*(HIGH|MEDIUM|LOW)\s*\|?\s*/i, '').trim();
     res.json({ quality, detail, raw: text });
@@ -698,15 +743,24 @@ app.get('/api/news', async (req, res) => {
   const { stock, symbol } = req.query;
   if (!stock) return res.status(400).json({ error: 'stock param required' });
   try {
-    const msg  = await client.messages.create({
-      model    : 'claude-haiku-4-5-20251001',
-      max_tokens: 120,
-      tools    : [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages : [{ role: 'user', content: `Search for news about ${stock} (${symbol}.NS) NSE India stock today ${new Date().toLocaleDateString('en-IN')}. Is there any major event (quarterly results, earnings, regulatory action, management change, FPO, acquisition) that would make intraday technical analysis unreliable today? Reply with ONLY: CLEAR or CAUTION: [one short reason]` }],
-    });
-    const text    = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
+    const newsPrompt = `Search for news about ${stock} (${symbol}.NS) NSE India stock today ${new Date().toLocaleDateString('en-IN')}. Is there any major event (quarterly results, earnings, regulatory action, management change, FPO, acquisition) that would make intraday technical analysis unreliable today? Reply with ONLY: CLEAR or CAUTION: [one short reason]`;
+    // Use Claude with web_search tool, fall back to Grok plain text
+    let text = '';
+    try {
+      const msg = await client.messages.create({
+        model: 'claude-haiku-4-5-20251001', max_tokens: 120,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: newsPrompt }],
+      });
+      text = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
+    } catch (e) {
+      if ((e.status === 400 || e.message?.includes('credit')) && grokEnabled) {
+        const r = await callGrok(newsPrompt, 120);
+        text = r;
+      } else throw e;
+    }
     const isClear = text.toUpperCase().includes('CLEAR') && !text.toUpperCase().includes('CAUTION');
-    res.json({ status: isClear ? 'CLEAR' : 'CAUTION', detail: text.replace(/^CLEAR\s*/i, '').replace(/^CAUTION:\s*/i, '').trim() || text });
+    res.json({ status: isClear ? 'CLEAR' : 'CAUTION', detail: text.replace(/^CLEAR\s*/i,'').replace(/^CAUTION:\s*/i,'').trim()||text });
   } catch (err) {
     console.error('News check failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -1093,18 +1147,24 @@ Reply ONLY with valid JSON array — no other text, no markdown:
 ]
 action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pick 5-8 stocks only.`;
 
-    const msg = await client.messages.create({
-      model    : 'claude-haiku-4-5-20251001',
-      max_tokens: 2000,
-      tools    : [{ type: 'web_search_20250305', name: 'web_search' }],
-      messages : [{ role: 'user', content: prompt }],
-    });
-
-    // Extract text from response (may have tool_use blocks + text)
-    const text = msg.content
-      .filter(b => b.type === 'text')
-      .map(b => b.text)
-      .join('');
+    // Try Claude with web_search, fall back to Grok without web_search
+    let text = '';
+    let aiSource = 'claude';
+    try {
+      const msg = await client.messages.create({
+        model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
+        messages: [{ role: 'user', content: prompt }],
+      });
+      text = msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
+    } catch (e) {
+      const isCredit = e.status === 400 || e.message?.includes('credit');
+      if (isCredit && grokEnabled) {
+        console.log('Claude credits exhausted — using Grok for prediction');
+        text = await callGrok(prompt, 2000);
+        aiSource = 'grok';
+      } else throw e;
+    }
 
     let predictions = [];
     try {
@@ -1112,13 +1172,12 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
       predictions = match ? JSON.parse(match[0]) : [];
     } catch { predictions = []; }
 
-    // Enrich with technical data
     predictions = predictions.map(p => {
       const stock = stocks.find(s => s.sym === p.symbol);
       return { ...p, technicals: stock ? { ema20: stock.ema20, aboveEma: stock.aboveEma, volShock: stock.volShock, rangePos: stock.rangePos, high5: stock.high5, low5: stock.low5 } : null };
     });
 
-    res.json({ predictions, stockCount: stocks.length, generatedAt: new Date().toISOString() });
+    res.json({ predictions, stockCount: stocks.length, generatedAt: new Date().toISOString(), aiSource });
   } catch (err) {
     console.error('AI prediction failed:', err.message);
     const isCredit = err.message?.includes('credit') || err.status === 400;
