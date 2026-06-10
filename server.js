@@ -6,7 +6,6 @@
 //   UPSTOX_API_KEY   — from developer.upstox.com
 //   UPSTOX_SECRET    — from developer.upstox.com
 //   UPSTOX_REDIRECT  — https://trade-engine-proxy.onrender.com/auth/upstox/callback
-
 const express   = require('express');
 const axios     = require('axios');
 const cors      = require('cors');
