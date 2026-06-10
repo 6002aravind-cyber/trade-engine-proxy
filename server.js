@@ -661,19 +661,29 @@ app.get('/api/screener', async (req, res) => {
 
   try {
     const symList = symbols.split(',').filter(Boolean);
+    const FIELDS  = 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange';
+    const BATCH   = 80; // v7/quote supports up to 100 symbols per call
+    const flat    = [];
 
-    // Fetch with concurrency limit of 10 parallel requests
-    const CONCURRENCY = 10;
-    const results = [];
-    for (let i = 0; i < symList.length; i += CONCURRENCY) {
-      const batch = symList.slice(i, i + CONCURRENCY);
-      const batchResults = await Promise.all(batch.map(fetchOneQuote));
-      results.push(...batchResults.filter(Boolean));
-      // Small delay to avoid rate limiting
-      if (i + CONCURRENCY < symList.length) await new Promise(r => setTimeout(r, 150));
+    for (let i = 0; i < symList.length; i += BATCH) {
+      const batch   = symList.slice(i, i + BATCH);
+      const joined  = batch.join(',');
+      try {
+        const url  = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(joined)}&fields=${FIELDS}`;
+        const data = await yfGet(url);
+        const rows = data?.quoteResponse?.result || [];
+        rows.forEach(q => {
+          if (q.regularMarketPrice > 0) flat.push(q);
+        });
+      } catch (batchErr) {
+        console.warn(`Screener batch ${i}-${i+BATCH} failed:`, batchErr.message);
+        // Fall back to one-by-one for this batch if v7 fails
+        const fallback = await Promise.all(batch.map(fetchOneQuote));
+        fallback.filter(Boolean).forEach(q => flat.push(q));
+      }
+      if (i + BATCH < symList.length) await new Promise(r => setTimeout(r, 200));
     }
 
-    const flat = results.filter(q => q.regularMarketPrice > 0);
     if (flat.length > 0) screenerCache = { data: flat, fetchedAt: Date.now() };
     if (flat.length === 0 && screenerCache.data)
       return res.json({ quotes: screenerCache.data, cached: true, stale: true });
