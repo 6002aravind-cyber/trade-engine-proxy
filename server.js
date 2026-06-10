@@ -270,7 +270,6 @@ const IKEY = {
   'PFC'        : 'NSE_EQ|INE134E01011',
   'IRFC'       : 'NSE_EQ|INE053F01010',
   'HUDCO'      : 'NSE_EQ|INE031A01017',
-  'BAJAJFINSV' : 'NSE_EQ|INE918I01026',
   'AAVAS'      : 'NSE_EQ|INE216P01012',
   'CREDITACC'  : 'NSE_EQ|INE741K01010',
   // ── Auto ──
@@ -321,7 +320,6 @@ const IKEY = {
   'IRCTC'      : 'NSE_EQ|INE335Y01020',
   'INDIGO'     : 'NSE_EQ|INE646L01027',
   // ── Retail ──
-  'TITAN'      : 'NSE_EQ|INE280A01028',
   'KALYANKJIL' : 'NSE_EQ|INE303R01014',
   // ── Pharma/Health ──
   'LALPATHLAB' : 'NSE_EQ|INE600L01024',
@@ -661,29 +659,19 @@ app.get('/api/screener', async (req, res) => {
 
   try {
     const symList = symbols.split(',').filter(Boolean);
-    const FIELDS  = 'regularMarketPrice,regularMarketVolume,averageDailyVolume10Day,regularMarketChangePercent,regularMarketChange';
-    const BATCH   = 80; // v7/quote supports up to 100 symbols per call
-    const flat    = [];
 
-    for (let i = 0; i < symList.length; i += BATCH) {
-      const batch   = symList.slice(i, i + BATCH);
-      const joined  = batch.join(',');
-      try {
-        const url  = `https://query1.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(joined)}&fields=${FIELDS}`;
-        const data = await yfGet(url);
-        const rows = data?.quoteResponse?.result || [];
-        rows.forEach(q => {
-          if (q.regularMarketPrice > 0) flat.push(q);
-        });
-      } catch (batchErr) {
-        console.warn(`Screener batch ${i}-${i+BATCH} failed:`, batchErr.message);
-        // Fall back to one-by-one for this batch if v7 fails
-        const fallback = await Promise.all(batch.map(fetchOneQuote));
-        fallback.filter(Boolean).forEach(q => flat.push(q));
-      }
-      if (i + BATCH < symList.length) await new Promise(r => setTimeout(r, 200));
+    // Fetch with concurrency limit of 10 parallel requests
+    const CONCURRENCY = 10;
+    const results = [];
+    for (let i = 0; i < symList.length; i += CONCURRENCY) {
+      const batch = symList.slice(i, i + CONCURRENCY);
+      const batchResults = await Promise.all(batch.map(fetchOneQuote));
+      results.push(...batchResults.filter(Boolean));
+      // Small delay to avoid rate limiting
+      if (i + CONCURRENCY < symList.length) await new Promise(r => setTimeout(r, 150));
     }
 
+    const flat = results.filter(q => q.regularMarketPrice > 0);
     if (flat.length > 0) screenerCache = { data: flat, fetchedAt: Date.now() };
     if (flat.length === 0 && screenerCache.data)
       return res.json({ quotes: screenerCache.data, cached: true, stale: true });
@@ -1074,8 +1062,8 @@ app.get('/api/aiprediction', async (req, res) => {
       PREDICT_UNIVERSE.map(async ({ sym, name }) => {
         try {
           const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=10d&includePrePost=false`;
-          const r = await axios.get(url, { headers: { 'User-Agent': YF_UA }, timeout: 8000 });
-          const result = r.data?.chart?.result?.[0];
+          const r = await yfGet(url);
+          const result = r?.chart?.result?.[0];
           if (!result) return null;
           const meta = result.meta;
           const ts   = result.timestamp || [];
