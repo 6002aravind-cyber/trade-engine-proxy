@@ -6,6 +6,7 @@
 //   UPSTOX_API_KEY   — from developer.upstox.com
 //   UPSTOX_SECRET    — from developer.upstox.com
 //   UPSTOX_REDIRECT  — https://trade-engine-proxy.onrender.com/auth/upstox/callback
+
 const express   = require('express');
 const axios     = require('axios');
 const cors      = require('cors');
@@ -706,7 +707,7 @@ Reply ONLY valid JSON, no other text:
     res.json({ picks, mode, aiSource: aiSrc });
   } catch (err) {
     console.error('AI pick failed:', err.message);
-    const isCredit = err.message?.includes('credit') || err.status === 400;
+    const isCredit = err.message?.includes('credit') || err.status === 529;
     res.status(isCredit?402:500).json({ error: isCredit ? 'credit_exhausted' : err.message });
   }
 });
@@ -1151,13 +1152,13 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
     let aiSource = 'claude';
     try {
       const msg = await client.messages.create({
-        model: 'claude-haiku-4-5-20251001', max_tokens: 2000,
+        model: 'claude-haiku-4-5', max_tokens: 2000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       });
       text = msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
     } catch (e) {
-      const isCredit = e.status === 400 || e.message?.includes('credit');
+      const isCredit = e.status === 529 || e.message?.includes('credit') || e.message?.includes('overloaded');
       if (isCredit && grokEnabled) {
         console.log('Claude credits exhausted — using Grok for prediction');
         text = await callGrok(prompt, 2000);
@@ -1179,7 +1180,7 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
     res.json({ predictions, stockCount: stocks.length, generatedAt: new Date().toISOString(), aiSource });
   } catch (err) {
     console.error('AI prediction failed:', err.message);
-    const isCredit = err.message?.includes('credit') || err.status === 400;
+    const isCredit = err.message?.includes('credit') || err.status === 529;
     res.status(isCredit?402:500).json({ error: isCredit ? 'credit_exhausted' : err.message });
   }
 });
