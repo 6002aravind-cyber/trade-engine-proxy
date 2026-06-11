@@ -32,6 +32,21 @@ const callGrok = async (prompt, maxTokens = 1000) => {
   return r.data.choices?.[0]?.message?.content || '';
 };
 
+// Grok with live web search enabled (grok-3 supports search_parameters)
+const callGrokSearch = async (prompt, maxTokens = 1000) => {
+  if (!grokEnabled) throw new Error('Grok not configured');
+  const r = await axios.post('https://api.x.ai/v1/chat/completions', {
+    model: 'grok-3',
+    max_tokens: maxTokens,
+    messages: [{ role: 'user', content: prompt }],
+    search_parameters: { mode: 'on' },
+  }, {
+    headers: { 'Authorization': `Bearer ${process.env.GROK_API_KEY}`, 'Content-Type': 'application/json' },
+    timeout: 40000,
+  });
+  return r.data.choices?.[0]?.message?.content || '';
+};
+
 const callClaude = async (prompt, maxTokens = 1000, tools = null) => {
   const params = {
     model: 'claude-haiku-4-5',
@@ -793,24 +808,28 @@ app.get('/api/news', async (req, res) => {
   const { stock, symbol } = req.query;
   if (!stock) return res.status(400).json({ error: 'stock param required' });
   try {
-    const newsPrompt = `Search for news about ${stock} (${symbol}.NS) NSE India stock today ${new Date().toLocaleDateString('en-IN')}. Is there any major event (quarterly results, earnings, regulatory action, management change, FPO, acquisition) that would make intraday technical analysis unreliable today? Reply with ONLY: CLEAR or CAUTION: [one short reason]`;
-    // Use Claude with web_search tool, fall back to Grok plain text
     let text = '';
-    try {
-      const msg = await client.messages.create({
-        model: 'claude-sonnet-4-5-20250514', max_tokens: 120,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{ role: 'user', content: newsPrompt }],
-      });
-      text = msg.content?.filter(b => b.type === 'text').map(b => b.text).join('') || '';
-    } catch (e) {
-      if ((e.status === 529 || e.message?.includes('credit') || e.message?.includes('overloaded')) && grokEnabled) {
-        const r = await callGrok(newsPrompt, 120);
-        text = r;
-      } else throw e;
+    if (grokEnabled) {
+      // Step 1 — Grok searches the web for today's news
+      const searchPrompt = `Search for news about ${stock} (${symbol} NSE India) today ${new Date().toLocaleDateString('en-IN')}. Is there any major event (quarterly results, earnings, regulatory action, management change, FPO, acquisition, block deal) that would make intraday technical analysis unreliable today? Summarise in 2-3 sentences.`;
+      const newsSummary = await callGrokSearch(searchPrompt, 200).catch(() => '');
+
+      // Step 2 — Haiku classifies based on Grok's summary
+      const classifyPrompt = `You are an NSE intraday risk filter. Based on this news summary, decide if trading ${stock} today is CLEAR or requires CAUTION.
+
+News summary: ${newsSummary || 'No significant news found.'}
+
+Reply with ONLY: CLEAR or CAUTION: [one short reason]`;
+      const { text: t } = await callAI(classifyPrompt, 60);
+      text = t;
+    } else {
+      // No Grok — Haiku classifies from its training knowledge only
+      const newsPrompt = `Is there any known major event for ${stock} (${symbol} NSE India) — quarterly results, regulatory action, acquisition — that would make intraday trading unreliable today ${new Date().toLocaleDateString('en-IN')}? Reply ONLY: CLEAR or CAUTION: [one short reason]`;
+      const { text: t } = await callAI(newsPrompt, 60);
+      text = t;
     }
     const isClear = text.toUpperCase().includes('CLEAR') && !text.toUpperCase().includes('CAUTION');
-    res.json({ status: isClear ? 'CLEAR' : 'CAUTION', detail: text.replace(/^CLEAR\s*/i,'').replace(/^CAUTION:\s*/i,'').trim()||text });
+    res.json({ status: isClear ? 'CLEAR' : 'CAUTION', detail: text.replace(/^CLEAR\s*/i,'').replace(/^CAUTION:\s*/i,'').trim() || text });
   } catch (err) {
     console.error('News check failed:', err.message);
     res.status(500).json({ error: err.message });
@@ -1163,7 +1182,7 @@ app.get('/api/aiprediction', async (req, res) => {
 
     if (!stocks.length) return res.status(500).json({ error: 'Failed to fetch stock data' });
 
-    // 2. Use Claude with web_search to analyse each stock and predict today
+    // 2. Grok searches today's news for all stocks, Haiku produces final predictions
     const today = new Date().toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
     const stockSummary = stocks.map(s =>
       `${s.sym} (${s.sector}) | ₹${s.price} | ${s.changePct > 0 ? '+' : ''}${s.changePct}% yesterday | ` +
@@ -1171,16 +1190,35 @@ app.get('/api/aiprediction', async (req, res) => {
       `5d range position: ${s.rangePos}% | 5d H:${s.high5} L:${s.low5}`
     ).join('\n');
 
-    const prompt = `Today is ${today}. You are an NSE intraday analyst. Analyse these 25 liquid NSE stocks for today's intraday session.
+    let newsContext = '';
+    let aiSource = 'haiku';
 
-STOCK DATA (yesterday's close + 5-day technicals):
+    // Step 1 — Grok searches the web for today's market news
+    if (grokEnabled) {
+      try {
+        const newsSearchPrompt = `Today is ${today}. Search the web and give me a brief news summary for NSE India intraday trading today. Cover:
+1. Global cues (US markets, crude oil, dollar-rupee)
+2. FII/DII activity today
+3. Any major NSE stock-specific news (results, upgrades, block deals, regulatory) for these stocks: ${stocks.map(s => s.sym).join(', ')}
+
+Keep it concise — 1 line per stock that has news, skip stocks with no news.`;
+        newsContext = await callGrokSearch(newsSearchPrompt, 800);
+        console.log('Grok news search done, length:', newsContext.length);
+      } catch (e) {
+        console.warn('Grok search failed, continuing without news:', e.message);
+        newsContext = 'Web search unavailable — analysis based on technicals only.';
+      }
+    }
+
+    // Step 2 — Haiku analyses technicals + Grok news → JSON predictions
+    const analysisPrompt = `Today is ${today}. You are an NSE intraday analyst. Analyse these 25 liquid NSE stocks for today's session.
+
+TECHNICAL DATA (yesterday's close + 5-day indicators):
 ${stockSummary}
 
-For each stock, search the web for:
-1. Any major news today (results, FII buying/selling, sector news, global cues)
-2. Technical pattern (breakout/breakdown, trend strength, key level proximity)
+${newsContext ? `TODAY'S NEWS & MARKET CONTEXT (from live web search):\n${newsContext}` : ''}
 
-Then give your TOP 5-8 stocks with highest intraday potential today.
+Based on both technical setup and any news above, pick the TOP 5-8 stocks with highest intraday potential today.
 
 Reply ONLY with valid JSON array — no other text, no markdown:
 [
@@ -1197,23 +1235,13 @@ Reply ONLY with valid JSON array — no other text, no markdown:
 ]
 action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pick 5-8 stocks only.`;
 
-    // Try Claude with web_search, fall back to Grok without web_search
     let text = '';
-    let aiSource = 'claude';
     try {
-      const msg = await client.messages.create({
-        model: 'claude-sonnet-4-5-20250514', max_tokens: 2000,
-        tools: [{ type: 'web_search_20250305', name: 'web_search' }],
-        messages: [{ role: 'user', content: prompt }],
-      });
-      text = msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
+      const { text: t, source } = await callAI(analysisPrompt, 2000);
+      text = t;
+      aiSource = newsContext && grokEnabled ? `grok-search+${source}` : source;
     } catch (e) {
-      const isCredit = e.status === 529 || e.message?.includes('credit') || e.message?.includes('overloaded');
-      if (isCredit && grokEnabled) {
-        console.log('Claude credits exhausted — using Grok for prediction');
-        text = await callGrok(prompt, 2000);
-        aiSource = 'grok';
-      } else throw e;
+      throw e;
     }
 
     let predictions = [];
