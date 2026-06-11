@@ -608,19 +608,71 @@ app.get('/api/fii', async (req, res) => {
 });
 
 // ── PCR ───────────────────────────────────────────────────
+// NSE blocks datacenter IPs (Render = AWS Oregon) intermittently.
+// Strategy: try NSE first with retried session, fall back to
+// Upstox option-chain if token available, then return null gracefully.
 app.get('/api/pcr', async (req, res) => {
+  // ── Attempt 1: NSE option chain (with fresh session) ──
   try {
+    // Force-refresh NSE session each time for PCR (avoids stale cookies)
+    session.fetchedAt = 0;
     const cookies  = await getSession();
-    const response = await axios.get('https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY', { headers: { ...NSE_HEADERS, Cookie: cookies }, timeout: 15000 });
-    const records  = response.data?.records?.data || [];
-    let putOI = 0, callOI = 0;
-    records.forEach(r => { if (r.PE) putOI += (r.PE.openInterest || 0); if (r.CE) callOI += (r.CE.openInterest || 0); });
-    const pcr = callOI > 0 ? parseFloat((putOI / callOI).toFixed(2)) : null;
-    res.json({ pcr, putOI, callOI, timestamp: new Date().toISOString() });
+    if (cookies) {
+      const response = await axios.get(
+        'https://www.nseindia.com/api/option-chain-indices?symbol=NIFTY',
+        { headers: { ...NSE_HEADERS, Cookie: cookies }, timeout: 15000 }
+      );
+      const records = response.data?.records?.data || [];
+      let putOI = 0, callOI = 0;
+      records.forEach(r => {
+        if (r.PE) putOI  += (r.PE.openInterest  || 0);
+        if (r.CE) callOI += (r.CE.openInterest || 0);
+      });
+      if (callOI > 0) {
+        const pcr = parseFloat((putOI / callOI).toFixed(2));
+        console.log(`PCR from NSE: ${pcr}`);
+        return res.json({ pcr, putOI, callOI, source: 'nse', timestamp: new Date().toISOString() });
+      }
+    }
   } catch (err) {
-    console.error('PCR fetch failed:', err.message);
-    res.status(500).json({ error: err.message });
+    console.warn('PCR NSE attempt failed:', err.message);
   }
+
+  // ── Attempt 2: Upstox option chain (if token available) ──
+  if (isUpstoxReady()) {
+    try {
+      const expUrl = 'https://api.upstox.com/v2/option/chain?instrument_key=NSE_INDEX%7CNifty+50&expiry_date=';
+      // Get nearest expiry
+      const expRes = await axios.get(
+        'https://api.upstox.com/v2/option/chain/instruments/NSE_INDEX%7CNifty+50',
+        { headers: { Authorization: `Bearer ${upstoxToken.access_token}`, Accept: 'application/json' }, timeout: 10000 }
+      );
+      const expiries = expRes.data?.data || [];
+      if (expiries.length > 0) {
+        const nearestExp = expiries[0];
+        const chainRes = await axios.get(`${expUrl}${nearestExp}`, {
+          headers: { Authorization: `Bearer ${upstoxToken.access_token}`, Accept: 'application/json' }, timeout: 12000
+        });
+        const chainData = chainRes.data?.data || [];
+        let putOI = 0, callOI = 0;
+        chainData.forEach(row => {
+          putOI  += (row.put_options?.market_data?.oi  || 0);
+          callOI += (row.call_options?.market_data?.oi || 0);
+        });
+        if (callOI > 0) {
+          const pcr = parseFloat((putOI / callOI).toFixed(2));
+          console.log(`PCR from Upstox: ${pcr}`);
+          return res.json({ pcr, putOI, callOI, source: 'upstox', timestamp: new Date().toISOString() });
+        }
+      }
+    } catch (err) {
+      console.warn('PCR Upstox attempt failed:', err.message);
+    }
+  }
+
+  // ── Graceful null — frontend shows "N/A" instead of crashing ──
+  console.warn('PCR: all sources failed, returning null');
+  res.json({ pcr: null, putOI: 0, callOI: 0, source: 'unavailable', timestamp: new Date().toISOString() });
 });
 
 // ── SCREENER CACHE + SMART SCREENER ──────────────────────
