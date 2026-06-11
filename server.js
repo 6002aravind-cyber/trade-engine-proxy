@@ -798,7 +798,7 @@ app.get('/api/news', async (req, res) => {
     let text = '';
     try {
       const msg = await client.messages.create({
-        model: 'claude-haiku-4-5', max_tokens: 120,
+        model: 'claude-sonnet-4-5-20250514', max_tokens: 120,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: newsPrompt }],
       });
@@ -1202,7 +1202,7 @@ action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pi
     let aiSource = 'claude';
     try {
       const msg = await client.messages.create({
-        model: 'claude-haiku-4-5', max_tokens: 2000,
+        model: 'claude-sonnet-4-5-20250514', max_tokens: 2000,
         tools: [{ type: 'web_search_20250305', name: 'web_search' }],
         messages: [{ role: 'user', content: prompt }],
       });
