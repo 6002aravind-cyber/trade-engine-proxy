@@ -58,20 +58,54 @@ const callClaude = async (prompt, maxTokens = 1000, tools = null) => {
   return msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
 };
 
-// Try Claude first, fall back to Grok on any error if Grok is available
+const geminiEnabled = !!process.env.GEMINI_API_KEY;
+
+const callGemini = async (prompt, maxTokens = 1000, model = 'gemini-1.5-pro') => {
+  if (!geminiEnabled) throw new Error('Gemini not configured');
+  const r = await axios.post(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${process.env.GEMINI_API_KEY}`,
+    { contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: { maxOutputTokens: maxTokens, temperature: 0.3 } },
+    { timeout: 30000 }
+  );
+  return r.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+};
+
+// Try Claude → Gemini Pro → Gemini Flash (in order)
 const callAI = async (prompt, maxTokens = 1000, tools = null) => {
+  // 1. Claude Haiku
   try {
     const text = await callClaude(prompt, maxTokens, tools);
     return { text, source: 'claude' };
   } catch (e) {
     console.warn('Claude failed:', e.status, e.message?.slice(0, 80));
-    if (grokEnabled) {
-      console.log('Falling back to Grok');
+  }
+  // 2. Gemini 1.5 Pro
+  if (geminiEnabled) {
+    try {
+      const text = await callGemini(prompt, maxTokens, 'gemini-1.5-pro');
+      return { text, source: 'gemini-pro' };
+    } catch (e) {
+      console.warn('Gemini Pro failed:', e.message?.slice(0, 60));
+    }
+    // 3. Gemini 1.5 Flash (rate limit fallback)
+    try {
+      const text = await callGemini(prompt, maxTokens, 'gemini-1.5-flash');
+      return { text, source: 'gemini-flash' };
+    } catch (e) {
+      console.warn('Gemini Flash failed:', e.message?.slice(0, 60));
+    }
+  }
+  // 4. Grok (if configured)
+  if (grokEnabled) {
+    try {
       const text = await callGrok(prompt, maxTokens);
       return { text, source: 'grok' };
+    } catch (e) {
+      console.warn('Grok failed:', e.message?.slice(0, 60));
     }
-    throw e;
   }
+  throw new Error('All AI providers failed');
 };
 
 app.use(cors());
@@ -1470,9 +1504,10 @@ app.post('/api/feedback', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status  : 'ok',
-    version : 'v3.1 — haiku-4-5-20251001 + grok-search',
-    model   : 'claude-haiku-4-5-20251001',
-    grok    : grokEnabled ? 'enabled (fallback)' : 'not configured',
+    version : 'v3.2 — haiku + gemini-pro + grok',
+    model   : 'claude-haiku-4-5-20251001 → gemini-1.5-pro → gemini-flash → grok',
+    gemini  : geminiEnabled ? 'enabled' : 'not configured',
+    grok    : grokEnabled ? 'enabled' : 'not configured',
     server  : 'Trade Engine Proxy',
     time    : new Date().toISOString(),
     nse     : session.fetchedAt ? 'session active' : 'no session',
