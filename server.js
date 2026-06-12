@@ -909,7 +909,12 @@ Pick 1-3 best for ${mode} intraday. Rules: BUY = positive momentum + volume surg
 Reply ONLY valid JSON, no other text:
 [{"symbol":"RELIANCE","action":"BUY","entry":2850.5,"sl":2821.5,"target":2908.5,"reason":"Volume 3.2× avg, strong uptrend"}]`;
     const { text: rawText, source: aiSrc } = await callAI(prompt, 500);
-    const picks = JSON.parse(rawText.replace(/```json|```/g,'').trim());
+    let picks = [];
+    try {
+      const match = rawText.match(/\[[\s\S]*\]/);
+      picks = match ? JSON.parse(match[0]) : [];
+    } catch { picks = []; }
+    if (!picks.length) return res.status(500).json({ error: 'AI returned no valid picks' });
     res.json({ picks, mode, aiSource: aiSrc });
   } catch (err) {
     console.error('AI pick failed:', err.message);
@@ -1304,9 +1309,9 @@ app.get('/api/aiprediction', async (req, res) => {
             const ikey = getIKey(cleanSym);
             if (ikey) {
               const encodedKey = encodeURIComponent(ikey);
-              const today = new Date().toISOString().split('T')[0];
-              const from  = new Date(Date.now() - 21 * 24 * 3600 * 1000).toISOString().split('T')[0]; // 21 calendar days = ~15 trading days
-              const data = await upstoxGet(`/historical-candle/${encodedKey}/1day/${from}/${today}`);
+              const toDate   = new Date().toISOString().split('T')[0];
+              const fromDate = new Date(Date.now() - 21 * 24 * 3600 * 1000).toISOString().split('T')[0];
+              const data = await upstoxGet(`/historical-candle/${encodedKey}/1day/${toDate}/${fromDate}`);
               const raw = (data.data?.candles || []).slice(0, 10).reverse(); // newest-first → oldest-first, last 10 days
               const days = raw.map(c => ({
                 date  : c[0].split('T')[0],
