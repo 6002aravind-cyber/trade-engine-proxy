@@ -812,19 +812,28 @@ let screenerCache = { data: null, fetchedAt: 0 };
 // v8/chart works when v7/quote is blocked — fetch one symbol at a time
 const fetchOneQuote = async (sym) => {
   try {
-    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=5d&includePrePost=false`;
+    const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=10d&includePrePost=false`;
     const data = await yfGet(url);
-    const meta = data?.chart?.result?.[0]?.meta;
+    const result = data?.chart?.result?.[0];
+    const meta = result?.meta;
     if (!meta || !meta.regularMarketPrice) return null;
     const prev = meta.chartPreviousClose || meta.previousClose || meta.regularMarketPrice;
     const curr = meta.regularMarketPrice;
     const vol  = meta.regularMarketVolume || 0;
-    // averageDailyVolume10Day from meta if available
-    const avg10d = meta.averageDailyVolume10Day || meta.averageDailyVolume3Month || 0;
+
+    // Compute 10-day avg volume from candle data — meta.averageDailyVolume10Day is 0 outside market hours
+    let avg10d = meta.averageDailyVolume10Day || meta.averageDailyVolume3Month || 0;
+    if (!avg10d && result?.indicators?.quote?.[0]?.volume) {
+      const vols = result.indicators.quote[0].volume.filter(v => v > 0);
+      avg10d = vols.length ? Math.round(vols.reduce((a, b) => a + b, 0) / vols.length) : 0;
+    }
+    // If still no live vol (market closed), use yesterday's volume from candle data as current vol
+    const liveVol = vol > 0 ? vol : (result?.indicators?.quote?.[0]?.volume?.findLast?.(v => v > 0) || 0);
+
     return {
       symbol                    : sym,
       regularMarketPrice        : curr,
-      regularMarketVolume       : vol,
+      regularMarketVolume       : liveVol,
       averageDailyVolume10Day   : avg10d,
       regularMarketChangePercent: prev ? ((curr - prev) / prev) * 100 : 0,
       regularMarketChange       : curr - prev,
@@ -834,8 +843,21 @@ const fetchOneQuote = async (sym) => {
 
 app.get('/api/screener', async (req, res) => {
   const age = Date.now() - screenerCache.fetchedAt;
+
+  // Market hours IST: 9:15 AM – 3:30 PM weekdays
+  const now = new Date();
+  const istH = parseInt(new Intl.DateTimeFormat('en-IN', { hour: '2-digit', hour12: false, timeZone: 'Asia/Kolkata' }).format(now));
+  const istM = parseInt(new Intl.DateTimeFormat('en-IN', { minute: '2-digit', timeZone: 'Asia/Kolkata' }).format(now));
+  const istDay = now.toLocaleDateString('en-IN', { weekday: 'short', timeZone: 'Asia/Kolkata' });
+  const istMins = istH * 60 + istM;
+  const marketOpen = !['Sun', 'Sat'].includes(istDay) && istMins >= 555 && istMins <= 930; // 9:15–3:30
+  const marketLabel = marketOpen ? 'live' : 'yesterday_close';
+
+  // Return cache if fresh (2 min) or if market is closed and we have any cache
   if (screenerCache.data && age < 120000)
-    return res.json({ quotes: screenerCache.data, cached: true });
+    return res.json({ quotes: screenerCache.data, cached: true, marketLabel });
+  if (screenerCache.data && !marketOpen)
+    return res.json({ quotes: screenerCache.data, cached: true, stale: true, marketLabel });
 
   const { symbols } = req.query;
   if (!symbols) return res.status(400).json({ error: 'symbols required' });
@@ -843,26 +865,29 @@ app.get('/api/screener', async (req, res) => {
   try {
     const symList = symbols.split(',').filter(Boolean);
 
-    // Fetch with concurrency limit of 10 parallel requests
     const CONCURRENCY = 10;
     const results = [];
     for (let i = 0; i < symList.length; i += CONCURRENCY) {
       const batch = symList.slice(i, i + CONCURRENCY);
       const batchResults = await Promise.all(batch.map(fetchOneQuote));
       results.push(...batchResults.filter(Boolean));
-      // Small delay to avoid rate limiting
       if (i + CONCURRENCY < symList.length) await new Promise(r => setTimeout(r, 150));
     }
 
+    // When market is closed, Yahoo returns 0 for regularMarketVolume but valid prices
+    // Use prev close volume or just accept the price data without vol filter
     const flat = results.filter(q => q.regularMarketPrice > 0);
+
     if (flat.length > 0) screenerCache = { data: flat, fetchedAt: Date.now() };
+
     if (flat.length === 0 && screenerCache.data)
-      return res.json({ quotes: screenerCache.data, cached: true, stale: true });
+      return res.json({ quotes: screenerCache.data, cached: true, stale: true, marketLabel });
     if (flat.length === 0)
       return res.status(500).json({ error: 'Yahoo Finance returned 0 results — may be rate limiting. Wait 60s and retry.' });
-    res.json({ quotes: flat, cached: false });
+
+    res.json({ quotes: flat, cached: false, marketLabel });
   } catch (err) {
-    if (screenerCache.data) return res.json({ quotes: screenerCache.data, cached: true, stale: true });
+    if (screenerCache.data) return res.json({ quotes: screenerCache.data, cached: true, stale: true, marketLabel });
     res.status(500).json({ error: err.message });
   }
 });
@@ -1242,19 +1267,73 @@ const PREDICT_UNIVERSE = [
   { sym:'TECHM.NS',      name:'Tech Mahindra',        sector:'IT' },
 ];
 
+// ── Shared: compute indicators from an array of {open,high,low,close,volume,date} days ──
+function computeIndicators(days, sym, name, sector) {
+  const last = days.at(-1);
+  const prev = days.at(-2);
+  if (!last || !prev) return null;
+  const changePct = prev.close ? ((last.close - prev.close) / prev.close * 100) : 0;
+  const closes = days.map(d => d.close);
+  let ema20 = closes[0];
+  for (let i = 1; i < closes.length; i++) ema20 = closes[i] * (2/21) + ema20 * (19/21);
+  const avgVol5 = days.slice(-5).reduce((s, d) => s + d.volume, 0) / 5;
+  const volShock = avgVol5 ? parseFloat((last.volume / avgVol5).toFixed(2)) : 1;
+  const h5 = Math.max(...days.slice(-5).map(d => d.high));
+  const l5 = Math.min(...days.slice(-5).map(d => d.low));
+  const rangePos = h5 > l5 ? parseFloat(((last.close - l5) / (h5 - l5) * 100).toFixed(1)) : 50;
+  return {
+    sym, name, sector,
+    price: last.close, changePct: parseFloat(changePct.toFixed(2)),
+    ema20: parseFloat(ema20.toFixed(2)),
+    aboveEma: last.close > ema20,
+    volShock, rangePos, high5: h5, low5: l5,
+    days: days.slice(-5),
+  };
+}
+
 app.get('/api/aiprediction', async (req, res) => {
   try {
-    // 1. Fetch 5-day daily OHLCV for all prediction stocks in parallel
+    // 1. Fetch 10-day daily OHLCV — Upstox first, Yahoo fallback per stock
     const quoteResults = await Promise.allSettled(
-      PREDICT_UNIVERSE.map(async ({ sym, name }) => {
+      PREDICT_UNIVERSE.map(async ({ sym, name, sector }) => {
+        const cleanSym = sym.replace('.NS', '');
+
+        // ── Try Upstox daily candles first ──
+        if (isUpstoxReady()) {
+          try {
+            const ikey = getIKey(cleanSym);
+            if (ikey) {
+              const encodedKey = encodeURIComponent(ikey);
+              const today = new Date().toISOString().split('T')[0];
+              const from  = new Date(Date.now() - 21 * 24 * 3600 * 1000).toISOString().split('T')[0]; // 21 calendar days = ~15 trading days
+              const data = await upstoxGet(`/historical-candle/${encodedKey}/1day/${from}/${today}`);
+              const raw = (data.data?.candles || []).slice(0, 10).reverse(); // newest-first → oldest-first, last 10 days
+              const days = raw.map(c => ({
+                date  : c[0].split('T')[0],
+                open  : parseFloat((c[1] || 0).toFixed(2)),
+                high  : parseFloat((c[2] || 0).toFixed(2)),
+                low   : parseFloat((c[3] || 0).toFixed(2)),
+                close : parseFloat((c[4] || 0).toFixed(2)),
+                volume: c[5] || 0,
+              })).filter(d => d.close > 0);
+              if (days.length >= 2) {
+                const result = computeIndicators(days, cleanSym, name, sector);
+                if (result) return result;
+              }
+            }
+          } catch (e) {
+            console.warn(`Upstox daily candles failed for ${cleanSym}:`, e.message);
+          }
+        }
+
+        // ── Fall back to Yahoo Finance ──
         try {
           const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(sym)}?interval=1d&range=10d&includePrePost=false`;
           const r = await yfGet(url);
           const result = r?.chart?.result?.[0];
           if (!result) return null;
-          const meta = result.meta;
-          const ts   = result.timestamp || [];
-          const q    = result.indicators.quote[0];
+          const ts = result.timestamp || [];
+          const q  = result.indicators.quote[0];
           const days = ts.map((t, i) => ({
             date  : new Date(t * 1000).toISOString().split('T')[0],
             open  : parseFloat((q.open[i]  || 0).toFixed(2)),
@@ -1263,31 +1342,7 @@ app.get('/api/aiprediction', async (req, res) => {
             close : parseFloat((q.close[i] || 0).toFixed(2)),
             volume: q.volume[i] || 0,
           })).filter(d => d.close > 0);
-          const last   = days.at(-1);
-          const prev   = days.at(-2);
-          if (!last || !prev) return null;
-          const changePct = prev.close ? ((last.close - prev.close) / prev.close * 100) : 0;
-          // Simple technical indicators on daily data
-          const closes = days.map(d => d.close);
-          // EMA20
-          let ema20 = closes[0];
-          for (let i = 1; i < closes.length; i++) ema20 = closes[i] * (2/21) + ema20 * (19/21);
-          // 5-day avg volume
-          const avgVol5 = days.slice(-5).reduce((s, d) => s + d.volume, 0) / 5;
-          const volShock = avgVol5 ? parseFloat((last.volume / avgVol5).toFixed(2)) : 1;
-          // Simple range position (where is close in high-low range over 5 days)
-          const h5 = Math.max(...days.slice(-5).map(d => d.high));
-          const l5 = Math.min(...days.slice(-5).map(d => d.low));
-          const rangePos = h5 > l5 ? parseFloat(((last.close - l5) / (h5 - l5) * 100).toFixed(1)) : 50;
-          return {
-            sym: sym.replace('.NS', ''), name,
-            price: last.close, changePct: parseFloat(changePct.toFixed(2)),
-            ema20: parseFloat(ema20.toFixed(2)),
-            aboveEma: last.close > ema20,
-            volShock, rangePos,
-            high5: h5, low5: l5,
-            days: days.slice(-5), // last 5 daily candles
-          };
+          return computeIndicators(days, cleanSym, name, sector);
         } catch { return null; }
       })
     );
