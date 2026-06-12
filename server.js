@@ -1470,7 +1470,10 @@ app.post('/api/feedback', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status  : 'ok',
-    server  : 'Trade Engine Proxy v2 + Upstox',
+    version : 'v3.1 — haiku-4-5-20251001 + grok-search',
+    model   : 'claude-haiku-4-5-20251001',
+    grok    : grokEnabled ? 'enabled (fallback)' : 'not configured',
+    server  : 'Trade Engine Proxy',
     time    : new Date().toISOString(),
     nse     : session.fetchedAt ? 'session active' : 'no session',
     upstox  : isUpstoxReady()
