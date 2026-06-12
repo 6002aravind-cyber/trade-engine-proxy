@@ -49,7 +49,7 @@ const callGrokSearch = async (prompt, maxTokens = 1000) => {
 
 const callClaude = async (prompt, maxTokens = 1000, tools = null) => {
   const params = {
-    model: 'claude-haiku-4-5',
+    model: 'claude-haiku-4-5-20251001',
     max_tokens: maxTokens,
     messages: [{ role: 'user', content: prompt }],
   };
@@ -58,15 +58,15 @@ const callClaude = async (prompt, maxTokens = 1000, tools = null) => {
   return msg.content.filter(b => b.type === 'text').map(b => b.text).join('');
 };
 
-// Try Claude first, fall back to Grok if credits exhausted
+// Try Claude first, fall back to Grok on any error if Grok is available
 const callAI = async (prompt, maxTokens = 1000, tools = null) => {
   try {
     const text = await callClaude(prompt, maxTokens, tools);
     return { text, source: 'claude' };
   } catch (e) {
-    const isCredit = e.status === 529 || e.message?.includes('credit') || e.message?.includes('overloaded');
-    if (isCredit && grokEnabled) {
-      console.log('Claude credits exhausted — falling back to Grok');
+    console.warn('Claude failed:', e.status, e.message?.slice(0, 80));
+    if (grokEnabled) {
+      console.log('Falling back to Grok');
       const text = await callGrok(prompt, maxTokens);
       return { text, source: 'grok' };
     }
