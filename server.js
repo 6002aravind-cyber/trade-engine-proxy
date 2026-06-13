@@ -1528,6 +1528,8 @@ app.get('/', (req, res) => {
 
 app.listen(PORT, async () => {
   console.log(`Trade Engine Proxy running on port ${PORT}`);
+  console.log(`Claude API key: ${ANTHROPIC_KEY ? "✓ SET ("+ANTHROPIC_KEY.slice(0,8)+"...)" : "✗ MISSING — set ANTHROPIC_API_KEY on Render"}`);
+  console.log(`Gemini: ${geminiEnabled ? "✓ enabled" : "✗ not set"} | Grok: ${grokEnabled ? "✓ enabled" : "✗ not set"}`);
   // Try to restore Upstox token from Supabase on startup
   const saved = await loadTokenFromSupabase();
   if (saved) {
