@@ -74,14 +74,14 @@ const callGemini = async (prompt, maxTokens = 1000, model = 'gemini-1.5-pro') =>
   return r.data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 };
 
-// Try Claude → Gemini Pro → Gemini Flash (in order)
+// Try Claude → Gemini Pro → Grok → Gemini Flash (in order)
 const callAI = async (prompt, maxTokens = 1000, tools = null) => {
   // 1. Claude Haiku
   try {
     const text = await callClaude(prompt, maxTokens, tools);
     return { text, source: 'claude' };
   } catch (e) {
-    console.warn('Claude failed:', e.status, e.message?.slice(0, 80));
+    console.warn('Claude failed:', e.status, e.message?.slice(0, 120));
   }
   // 2. Gemini 1.5 Pro
   if (geminiEnabled) {
@@ -89,23 +89,25 @@ const callAI = async (prompt, maxTokens = 1000, tools = null) => {
       const text = await callGemini(prompt, maxTokens, 'gemini-1.5-pro');
       return { text, source: 'gemini-pro' };
     } catch (e) {
-      console.warn('Gemini Pro failed:', e.message?.slice(0, 60));
-    }
-    // 3. Gemini 1.5 Flash (rate limit fallback)
-    try {
-      const text = await callGemini(prompt, maxTokens, 'gemini-1.5-flash');
-      return { text, source: 'gemini-flash' };
-    } catch (e) {
-      console.warn('Gemini Flash failed:', e.message?.slice(0, 60));
+      console.warn('Gemini Pro failed:', e.message?.slice(0, 80));
     }
   }
-  // 4. Grok (if configured)
+  // 3. Grok mini
   if (grokEnabled) {
     try {
       const text = await callGrok(prompt, maxTokens);
       return { text, source: 'grok' };
     } catch (e) {
       console.warn('Grok failed:', e.message?.slice(0, 60));
+    }
+  }
+  // 4. Gemini 1.5 Flash (last resort)
+  if (geminiEnabled) {
+    try {
+      const text = await callGemini(prompt, maxTokens, 'gemini-1.5-flash');
+      return { text, source: 'gemini-flash' };
+    } catch (e) {
+      console.warn('Gemini Flash failed:', e.message?.slice(0, 60));
     }
   }
   throw new Error('All AI providers failed');
@@ -945,7 +947,7 @@ Pick 1-3 best for ${mode} intraday. Rules: BUY = positive momentum + volume surg
 
 Reply ONLY valid JSON, no other text:
 [{"symbol":"RELIANCE","action":"BUY","entry":2850.5,"sl":2821.5,"target":2908.5,"reason":"Volume 3.2× avg, strong uptrend"}]`;
-    const { text: rawText, source: aiSrc } = await callAI(prompt, 500);
+    const { text: rawText, source: aiSrc } = await callAI(prompt, 600);
     let picks = [];
     try {
       const match = rawText.match(/\[[\s\S]*\]/);
@@ -1423,34 +1425,27 @@ Keep it concise — 1 line per stock that has news, skip stocks with no news.`;
       }
     }
 
-    // Step 2 — Haiku analyses technicals + Grok news → JSON predictions
-    const analysisPrompt = `Today is ${today}. You are an NSE intraday analyst. Analyse these 25 liquid NSE stocks for today's session.
+    // Step 2 — AI analyses technicals + news → JSON predictions
+    // Cap to 15 stocks to keep prompt size manageable for all AI providers
+    const stocksForPrompt = stocks.slice(0, 15);
+    const stockSummaryShort = stocksForPrompt.map(s =>
+      `${s.sym}|₹${s.price}|${s.changePct>0?'+':''}${s.changePct}%|EMA${s.aboveEma?'↑':'↓'}|Vol${s.volShock}×|Rng${s.rangePos}%`
+    ).join('\n');
+    const newsShort = newsContext ? newsContext.slice(0, 800) : '';
 
-TECHNICAL DATA (yesterday's close + 5-day indicators):
-${stockSummary}
+    const analysisPrompt = `Today ${today}. NSE intraday analyst. Pick TOP 5 stocks from these 15 for today.
 
-${newsContext ? `TODAY'S NEWS & MARKET CONTEXT (from live web search):\n${newsContext}` : ''}
+STOCKS (sym|price|chg|ema|vol|range):
+${stockSummaryShort}
+${newsShort ? `\nNEWS:\n${newsShort}` : ''}
 
-Based on both technical setup and any news above, pick the TOP 5-8 stocks with highest intraday potential today.
-
-Reply ONLY with valid JSON array — no other text, no markdown:
-[
-  {
-    "symbol": "RELIANCE",
-    "action": "BUY",
-    "confidence": "HIGH",
-    "price": 2850.5,
-    "reason": "2-sentence technical + news reason",
-    "pattern": "Breakout above 5d high",
-    "sector": "Oil & Gas",
-    "risk": "Watch for reversal at 2880"
-  }
-]
-action must be BUY, SHORT, or LEAVE. confidence must be HIGH, MEDIUM, or LOW. Pick 5-8 stocks only.`;
+Reply ONLY valid JSON array, no markdown, no text before/after:
+[{"symbol":"RELIANCE","action":"BUY","confidence":"HIGH","price":2850.5,"reason":"reason in 1 sentence","pattern":"pattern","sector":"Oil & Gas","risk":"risk note"}]
+action=BUY/SHORT/LEAVE. confidence=HIGH/MEDIUM/LOW. Exactly 5 stocks.`;
 
     let text = '';
     try {
-      const { text: t, source } = await callAI(analysisPrompt, 2000);
+      const { text: t, source } = await callAI(analysisPrompt, 1200);
       text = t;
       aiSource = newsContext && grokEnabled ? `grok-search+${source}` : source;
     } catch (e) {
@@ -1507,8 +1502,8 @@ app.post('/api/feedback', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status  : 'ok',
-    version : 'v3.3 — haiku + gemini-pro + grok',
-    model   : 'claude-haiku-4-5-20251001 → gemini-1.5-pro → gemini-flash → grok',
+    version : 'v3.4 — claude → gemini-pro → grok → gemini-flash',
+    model   : 'claude-haiku → gemini-pro → grok → gemini-flash',
     claude  : ANTHROPIC_KEY ? 'enabled' : '⚠ NOT CONFIGURED (set ANTHROPIC_API_KEY on Render)',
     gemini  : geminiEnabled ? 'enabled' : 'not configured',
     grok    : grokEnabled ? 'enabled' : 'not configured',
