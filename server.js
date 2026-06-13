@@ -1,11 +1,11 @@
 // Trade Engine — NSE Proxy + Upstox Integration
 // Deploy on Render.com free tier
 // Env vars needed:
-//   CLAUDE_API_KEY   — Anthropic key (existing)
-//   GROK_API_KEY     — xAI Grok key (free at console.x.ai)
-//   UPSTOX_API_KEY   — from developer.upstox.com
-//   UPSTOX_SECRET    — from developer.upstox.com
-//   UPSTOX_REDIRECT  — https://trade-engine-proxy.onrender.com/auth/upstox/callback
+//   ANTHROPIC_API_KEY — Anthropic key (set this on Render)
+//   GROK_API_KEY      — xAI Grok key (free at console.x.ai)
+//   UPSTOX_API_KEY    — from developer.upstox.com
+//   UPSTOX_SECRET     — from developer.upstox.com
+//   UPSTOX_REDIRECT   — https://trade-engine-proxy.onrender.com/auth/upstox/callback
 
 const express   = require('express');
 const axios     = require('axios');
@@ -14,7 +14,10 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const app    = express();
 const PORT   = process.env.PORT || 3001;
-const client = new Anthropic({ apiKey: process.env.CLAUDE_API_KEY });
+// Support both ANTHROPIC_API_KEY (standard) and legacy CLAUDE_API_KEY
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY || process.env.CLAUDE_API_KEY;
+if (!ANTHROPIC_KEY) console.warn('⚠ WARNING: Neither ANTHROPIC_API_KEY nor CLAUDE_API_KEY is set — Claude calls will fail');
+const client = new Anthropic({ apiKey: ANTHROPIC_KEY });
 
 // ── DUAL AI — Claude (primary) + Grok (fallback/parallel) ──
 const grokEnabled = !!process.env.GROK_API_KEY;
@@ -1504,8 +1507,9 @@ app.post('/api/feedback', async (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status  : 'ok',
-    version : 'v3.2 — haiku + gemini-pro + grok',
+    version : 'v3.3 — haiku + gemini-pro + grok',
     model   : 'claude-haiku-4-5-20251001 → gemini-1.5-pro → gemini-flash → grok',
+    claude  : ANTHROPIC_KEY ? 'enabled' : '⚠ NOT CONFIGURED (set ANTHROPIC_API_KEY on Render)',
     gemini  : geminiEnabled ? 'enabled' : 'not configured',
     grok    : grokEnabled ? 'enabled' : 'not configured',
     server  : 'Trade Engine Proxy',
